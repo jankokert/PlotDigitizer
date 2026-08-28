@@ -24,6 +24,7 @@ def extract_curves(
     notch_factor: float = 3.0,
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
+    debug: Optional[dict] = None,
 ) -> dict[str, np.ndarray]:
     """
     Extract digitised curves from the plot area.
@@ -56,6 +57,7 @@ def extract_curves(
         span_frac=span_frac,
         target_colors=target_colors,
         color_tolerance=color_tolerance,
+        debug=debug,
     )
 
     # Keep only the top-N masks by pixel count (skip when the user picked colours)
@@ -97,6 +99,7 @@ def _segment_by_color(
     span_frac: float = 0.55,
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
+    debug: Optional[dict] = None,
 ) -> dict[str, np.ndarray]:
     """
     Return {label: bool_mask} for each distinct colour group.
@@ -122,11 +125,36 @@ def _segment_by_color(
     if has_grid:
         grid_px = int(grid_mask.sum())
         logger.info(f"Grid pixels suppressed: {grid_px}")
+    if debug is not None:
+        debug["grid_mask"] = grid_mask
 
     if target_colors:
         return _segment_by_target_colors(
             canvas, target_colors, color_tolerance, grid_mask,
             min_col_coverage, min_pixel_fraction,
+        )
+
+    h_px, w_px = canvas.shape[:2]
+    total_pixels = h_px * w_px
+    # Scale pixel-fraction threshold proportionally when min_col_coverage is
+    # lower than the default (0.20), so partial curves aren't doubly rejected.
+    effective_min_px_frac = min_pixel_fraction * (min_col_coverage / 0.20)
+
+    # --- Auto-detect achromatic (black/white) plots ----------------------
+    # When the plot carries no real colour (datasheet line on a grid), hue and
+    # gray segmentation only produce garbage from grid / anti-aliasing bands.
+    # Switch to a single dark-line extraction instead — this is the automatic
+    # fallback the user asked for ("no colours → new method").
+    colored_fg = (s > sat_threshold) & (v > 0.15) & ~grid_mask
+    colored_cols = int(colored_fg.any(axis=0).sum())
+    if colored_cols < w_px * min_col_coverage:
+        logger.info(
+            f"Achromatic plot detected ({colored_cols}/{w_px} coloured columns) "
+            f"— using dark-line extraction only"
+        )
+        return _segment_achromatic(
+            s, v, grid_mask, w_px, total_pixels,
+            min_col_coverage, effective_min_px_frac,
         )
 
     # Hue in [0, 360)
@@ -140,13 +168,7 @@ def _segment_by_color(
     hue[mask_b] = 60.0 * ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 240
 
     # Foreground: saturated, not too dark, not a grid line
-    fg = (s > sat_threshold) & (v > 0.15) & ~grid_mask
-
-    h_px, w_px = canvas.shape[:2]
-    total_pixels = h_px * w_px
-    # Scale pixel-fraction threshold proportionally when min_col_coverage is
-    # lower than the default (0.20), so partial curves aren't doubly rejected.
-    effective_min_px_frac = min_pixel_fraction * (min_col_coverage / 0.20)
+    fg = colored_fg
 
     masks: dict[str, np.ndarray] = {}
 
@@ -204,6 +226,16 @@ def _segment_by_color(
         masks[label_i] = combined
         used[i] = True
 
+    # --- Black / near-black curves ---------------------------------------
+    # A thick black data line (v ≈ 0) is excluded from the gray range above.
+    # After grid suppression, remaining dark ink in the plot area is the
+    # curve itself (isolated text blobs fail the column-coverage test below).
+    black_fg = (s < 0.30) & (v < 0.25) & ~grid_mask
+    if black_fg.sum() >= total_pixels * effective_min_px_frac:
+        col_profile = black_fg.any(axis=0)
+        if col_profile.sum() >= w_px * min_col_coverage:
+            masks["curve_black"] = black_fg
+
     return masks
 
 
@@ -257,6 +289,42 @@ def _segment_by_target_colors(
     return masks
 
 
+def _segment_achromatic(
+    s: np.ndarray,
+    v: np.ndarray,
+    grid_mask: np.ndarray,
+    w_px: int,
+    total_pixels: int,
+    min_col_coverage: float,
+    effective_min_px_frac: float,
+) -> dict[str, np.ndarray]:
+    """
+    Extract a single dark data line from a black/white (achromatic) plot.
+
+    Tries progressively lighter value cut-offs and keeps the darkest one that
+    still spans enough of the canvas, so a pure-black line is preferred but a
+    mid-grey line is caught as a fallback.  Only one mask ("curve_black") is
+    returned — colour/gray binning is deliberately skipped here.
+    """
+    masks: dict[str, np.ndarray] = {}
+    for v_thresh in (0.25, 0.40, 0.55):
+        bin_mask = (s < 0.35) & (v < v_thresh) & ~grid_mask
+        if bin_mask.sum() < total_pixels * effective_min_px_frac:
+            continue
+        if bin_mask.any(axis=0).sum() < w_px * min_col_coverage:
+            continue
+        masks["curve_black"] = bin_mask
+        logger.info(
+            f"Dark line captured at v<{v_thresh} "
+            f"({int(bin_mask.sum())} px, "
+            f"{int(bin_mask.any(axis=0).sum())}/{w_px} columns)"
+        )
+        break
+    else:
+        logger.warning("Achromatic plot: no dark line met the coverage threshold")
+    return masks
+
+
 def _detect_grid(
     s: np.ndarray,
     v: np.ndarray,
@@ -266,33 +334,54 @@ def _detect_grid(
     """
     Identify grid / spine pixels to suppress before curve extraction.
 
-    Pass 1 — periodic horizontal/vertical grid lines:
-        Achromatic rows/columns that span ≥ span_frac of the canvas.
+    Grid lines are separated from the data curve **geometrically**, not by
+    colour — this is essential for datasheet plots where the grid and the
+    curve are both black (colour segmentation alone cannot tell them apart).
 
-    Pass 2 — canvas border / tick-mark area:
+    Pass 1 — light periodic grid lines (pale grey mesh):
+        Achromatic *light* rows/columns spanning ≥ span_frac of the canvas.
+
+    Pass 2 — dark / black grid lines (and the plot frame):
+        A true grid line is thin yet spans (almost) the entire width (a
+        horizontal line) or height (a vertical line).  A data curve is a
+        function: it is thick but never fills a whole row/column.  So we
+        flag any achromatic *ink* row/column whose coverage is ≥ full_span
+        (a deliberately high threshold, ~0.9) as a grid line.  The curve
+        survives because even its flat tail covers well under 90 % of the
+        width in any single row.  Curve pixels sitting on a grid crossing
+        are lost as small gaps, which the spline fit bridges cleanly.
+
+    Pass 3 — canvas border / tick-mark area:
         * Top & sides : small fixed margin (spine line width).
         * Bottom      : larger margin (h // 10) to cover x-axis tick marks
           and their anti-aliasing bleed, which can look like gray curves.
     """
     h, w = shape
 
-    candidate = (s < 0.12) & (v > 0.60) & (v < 0.97)
-
     grid_mask = np.zeros((h, w), dtype=bool)
 
-    # Horizontal grid lines
-    row_hits = candidate.sum(axis=1)
-    grid_mask[row_hits > w * span_frac, :] = True
+    # --- Pass 1: light grey grid mesh -----------------------------------
+    light = (s < 0.12) & (v > 0.60) & (v < 0.97)
+    grid_mask[light.sum(axis=1) > w * span_frac, :] = True
+    grid_mask[:, light.sum(axis=0) > h * span_frac] = True
 
-    # Vertical grid lines (and y-axis spine)
-    col_hits = candidate.sum(axis=0)
-    grid_mask[:, col_hits > h * span_frac] = True
+    # --- Pass 2: dark / black grid lines + frame ------------------------
+    # Any achromatic ink pixel (grid, curve, frame all qualify here).
+    ink = (s < 0.30) & (v < 0.45)
+    # Full-span threshold: a grid line spans nearly the whole axis; a curve
+    # never does.  Kept high so the curve's flat tail is not mistaken for a
+    # horizontal grid line.
+    full_span = 0.90
+    grid_mask[ink.sum(axis=1) > w * full_span, :] = True
+    grid_mask[:, ink.sum(axis=0) > h * full_span] = True
 
-    # Fixed border — top / left / right: just the spine (few pixels)
-    # Bottom: large enough to cover x-axis ticks + anti-aliasing
+    # --- Pass 3: fixed border ------------------------------------------
+    # Just the spine line width on every side.  The x-axis line and its tick
+    # bleed are already removed by the full-span passes above, so a big bottom
+    # margin is no longer needed (it used to blank the whole lower tenth).
     top = 5
     side = 5
-    bottom = max(10, h // 10)   # e.g. 34 px for h=342
+    bottom = 5
 
     grid_mask[:top, :] = True
     grid_mask[-bottom:, :] = True

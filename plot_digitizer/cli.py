@@ -162,6 +162,15 @@ def main() -> None:
         metavar="D",
         help="Max Euclidean RGB distance for --color matching (anti-aliasing / JPEG)",
     )
+    parser.add_argument(
+        "--debug-svg",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="PATH",
+        help="Write a debug SVG (source image + plot box + suppressed grid + "
+             "extracted points). Optional PATH; defaults to <output>_debug.svg",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -186,6 +195,13 @@ def main() -> None:
             logger.error(str(exc))
             sys.exit(1)
 
+    debug_svg_path = None
+    if args.debug_svg is not None:
+        if args.debug_svg is True:
+            debug_svg_path = output_path.with_name(output_path.stem + "_debug.svg")
+        else:
+            debug_svg_path = Path(args.debug_svg)
+
     from .digitizer import digitize_plot
 
     digitize_plot(
@@ -206,6 +222,7 @@ def main() -> None:
         notch_factor=args.notch_factor,
         target_colors=target_colors,
         color_tolerance=args.color_tolerance,
+        debug_svg=debug_svg_path,
     )
     logger.info(f"Output written to: {output_path}")
 

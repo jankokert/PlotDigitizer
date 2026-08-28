@@ -38,8 +38,14 @@ def read_axes(
     else:
         y_calib = _read_y_axis(img_array, plot_area) or _default_y(plot_area)
 
-    logger.info(f"X calibration: {x_calib}")
-    logger.info(f"Y calibration: {y_calib}")
+    # Clear, unmissable summary of what the axes were calibrated to.
+    x_lo = pixel_to_data(x_min, x_calib)
+    x_hi = pixel_to_data(x_max, x_calib)
+    y_bot = pixel_to_data(y_max, y_calib)   # bottom pixel row
+    y_top = pixel_to_data(y_min, y_calib)   # top pixel row
+    logger.info("--- Axis calibration (LINEAR only; log/semi-log not yet handled) ---")
+    logger.info(f"  X: data {x_lo:g} … {x_hi:g}   (calib {x_calib})")
+    logger.info(f"  Y: data {y_bot:g} (bottom) … {y_top:g} (top)   (calib {y_calib})")
     return x_calib, y_calib
 
 
@@ -84,9 +90,19 @@ def _read_x_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
 
     # Convert crop_col → image_x
     calibration_pts = sorted((col + x_min, val) for col, val in readings)
-    (px1, v1), (px2, v2) = calibration_pts[0], calibration_pts[-1]
-    logger.info(f"X OCR: {len(readings)} labels found")
-    return (px1, v1, px2, v2)
+    logger.info(
+        f"X OCR: {len(readings)} labels → "
+        + ", ".join(f"{val:g}@px{int(px)}" for px, val in calibration_pts)
+    )
+    fit = _robust_line(calibration_pts)
+    if fit is None:
+        return None
+    slope, intercept, kept = fit
+    if len(kept) < len(calibration_pts):
+        dropped = [f"{v:g}@px{int(p)}" for p, v in calibration_pts if (p, v) not in kept]
+        logger.info(f"X fit: rejected outlier label(s) {', '.join(dropped)}")
+    # Evaluate the fitted line at the plot-box edges for a full-span calibration.
+    return (x_min, slope * x_min + intercept, x_max, slope * x_max + intercept)
 
 
 def _read_y_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
@@ -107,9 +123,74 @@ def _read_y_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
         return None
 
     calibration_pts = sorted((row + y_min, val) for row, val in readings)
-    (py1, v1), (py2, v2) = calibration_pts[0], calibration_pts[-1]
-    logger.info(f"Y OCR: {len(readings)} labels found")
-    return (py1, v1, py2, v2)
+    logger.info(
+        f"Y OCR: {len(readings)} labels → "
+        + ", ".join(f"{val:g}@px{int(py)}" for py, val in calibration_pts)
+    )
+    fit = _robust_line(calibration_pts)
+    if fit is None:
+        return None
+    slope, intercept, kept = fit
+    if len(kept) < len(calibration_pts):
+        dropped = [f"{v:g}@px{int(p)}" for p, v in calibration_pts if (p, v) not in kept]
+        logger.info(f"Y fit: rejected outlier label(s) {', '.join(dropped)}")
+    return (y_min, slope * y_min + intercept, y_max, slope * y_max + intercept)
+
+
+def _robust_line(
+    points: list[tuple[float, float]],
+) -> Optional[tuple[float, float, list[tuple[float, float]]]]:
+    """
+    Fit value = slope * pixel + intercept through OCR tick labels, iteratively
+    discarding outliers (e.g. "100" misread as "1", or a stray "5").
+
+    Axis ticks are collinear in (pixel, value) space, so a single misread label
+    stands out as a large residual and is dropped.  Using *all* inlier labels
+    (not just the two endpoints) makes calibration robust to both misreads and
+    missing end labels — the fitted line extrapolates the true 0 / 100 edges.
+
+    Returns (slope, intercept, kept_points) or None if < 2 usable points.
+    """
+    pts = list(dict.fromkeys(points))  # dedupe, preserve order
+    if len(pts) < 2:
+        return None
+    if len(pts) == 2:
+        (p1, v1), (p2, v2) = pts
+        if p1 == p2:
+            return None
+        slope = (v2 - v1) / (p2 - p1)
+        return slope, v1 - slope * p1, pts
+
+    # RANSAC: a single misread label tilts a least-squares fit through *all*
+    # points, so instead find the line supported by the largest collinear
+    # subset. Axis ticks are exactly collinear, so the true line wins.
+    vals = [v for _, v in pts]
+    span = max(vals) - min(vals)
+    tol = max(0.02 * span, 0.5)  # data-units a label may deviate and still count
+
+    best_inliers: list[tuple[float, float]] = []
+    best_err = float("inf")
+    for a in range(len(pts)):
+        for b in range(a + 1, len(pts)):
+            (pa, va), (pb, vb) = pts[a], pts[b]
+            if pa == pb:
+                continue
+            slope = (vb - va) / (pb - pa)
+            intercept = va - slope * pa
+            inliers = [(p, v) for p, v in pts if abs(v - (slope * p + intercept)) <= tol]
+            err = sum((v - (slope * p + intercept)) ** 2 for p, v in inliers)
+            if len(inliers) > len(best_inliers) or (
+                len(inliers) == len(best_inliers) and err < best_err
+            ):
+                best_inliers, best_err = inliers, err
+
+    if len(best_inliers) < 2:
+        return None
+
+    px = np.array([p for p, _ in best_inliers], dtype=float)
+    val = np.array([v for _, v in best_inliers], dtype=float)
+    slope, intercept = np.polyfit(px, val, 1)
+    return float(slope), float(intercept), best_inliers
 
 
 def _ocr_numbers(

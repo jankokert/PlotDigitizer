@@ -34,6 +34,7 @@ def digitize_plot(
     notch_factor: float = 3.0,
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
+    debug_svg: Optional[Path] = None,
 ) -> None:
     """
     Full pipeline: load image → detect plot area → read axes → extract curves
@@ -60,6 +61,7 @@ def digitize_plot(
     )
 
     # 4. Extract curves
+    debug: Optional[dict] = {} if debug_svg else None
     curves = extract_curves(
         img_array, plot_area,
         method=method, smoothing=smoothing,
@@ -69,12 +71,24 @@ def digitize_plot(
         span_frac=span_frac, max_thickness=max_thickness,
         notch_factor=notch_factor,
         target_colors=target_colors, color_tolerance=color_tolerance,
+        debug=debug,
     )
     n_curves = len(curves)
     logger.info(f"Curves found: {n_curves}  (method={method})")
 
     if n_curves == 0:
         logger.warning("No curves detected — check image or try --verbose")
+
+    # 4b. Optional debug SVG overlay
+    if debug_svg:
+        from .debug_svg import write_debug_svg
+        write_debug_svg(
+            image_path=image_path,
+            out_path=debug_svg,
+            plot_area=plot_area,
+            curves=curves,
+            grid_mask=(debug or {}).get("grid_mask"),
+        )
 
     # 5. Convert pixel → data coordinates and collect rows
     rows: list[tuple[str, float, float]] = []
