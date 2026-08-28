@@ -1,0 +1,2 @@
+uv run plot_digitizer_web
+pause

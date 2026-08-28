@@ -26,7 +26,7 @@ app = FastAPI(title="PlotDigitizer")
 # In-memory image store: image_id → RGB uint8 ndarray
 _images: dict[str, np.ndarray] = {}
 
-_HTML = (Path(__file__).parent / "index.html").read_text()
+_HTML = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
