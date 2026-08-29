@@ -18,6 +18,7 @@ def read_axes(
     plot_area: tuple[int, int, int, int],
     x_range: Optional[tuple[float, float]] = None,
     y_range: Optional[tuple[float, float]] = None,
+    debug: Optional[dict] = None,
 ) -> tuple[Calibration, Calibration]:
     """
     Return (x_calib, y_calib) as linear calibration tuples.
@@ -31,7 +32,7 @@ def read_axes(
         x_calib: Calibration = (x_min, x_range[0], x_max, x_range[1], "lin")
         logger.info(f"X axis: manual range {x_range}")
     else:
-        x_calib = _read_x_axis(img_array, plot_area) or _default_x(plot_area)
+        x_calib = _read_x_axis(img_array, plot_area, debug) or _default_x(plot_area)
 
     if y_range is not None:
         # pixel y increases downward; data y increases upward
@@ -39,7 +40,7 @@ def read_axes(
         y_calib: Calibration = (y_min, y_range[1], y_max, y_range[0], "lin")
         logger.info(f"Y axis: manual range {y_range}")
     else:
-        y_calib = _read_y_axis(img_array, plot_area) or _default_y(plot_area)
+        y_calib = _read_y_axis(img_array, plot_area, debug) or _default_y(plot_area)
 
     # Clear, unmissable summary of what the axes were calibrated to.
     x_lo = pixel_to_data(x_min, x_calib)
@@ -82,56 +83,86 @@ def _tesseract():
         return None
 
 
-def _read_x_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
+def _read_x_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calibration]:
     pt = _tesseract()
     if pt is None:
         return None
 
     x_min, y_min, x_max, y_max = plot_area
-    h = img_array.shape[0]
+    h, w = img_array.shape[:2]
     crop_top = y_max + 3
     crop_bot = min(h, y_max + 70)
     if crop_top >= crop_bot:
         return None
 
-    crop = img_array[crop_top:crop_bot, x_min:x_max]
+    # Widen the strip past the box so edge labels (e.g. 0 and 100) are not clipped.
+    pad = 20
+    cx0 = max(0, x_min - pad)
+    crop = img_array[crop_top:crop_bot, cx0:min(w, x_max + pad)]
     readings = _ocr_numbers(crop, pt)  # (crop_col, value)
 
     if len(readings) < 2:
         return None
 
     # Convert crop_col → image_x
-    calibration_pts = sorted((col + x_min, val) for col, val in readings)
+    calibration_pts = sorted((col + cx0, val) for col, val in readings)
     logger.info(
         f"X OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(px)}" for px, val in calibration_pts)
     )
-    return _fit_axis(calibration_pts, x_min, x_max, "X")
+    calib = _fit_axis(calibration_pts, x_min, x_max, "X")
+    if debug is not None:
+        debug["x_ticks"] = _ticks_for_debug(calibration_pts, calib)
+    return calib
 
 
-def _read_y_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
+def _read_y_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calibration]:
     pt = _tesseract()
     if pt is None:
         return None
 
     x_min, y_min, x_max, y_max = plot_area
+    h = img_array.shape[0]
     crop_left = max(0, x_min - 90)
     crop_right = max(0, x_min - 3)
     if crop_left >= crop_right:
         return None
 
-    crop = img_array[y_min:y_max, crop_left:crop_right]
+    # Widen the strip past the box so edge labels (e.g. 0 and 20) are not clipped.
+    pad = 20
+    cy0 = max(0, y_min - pad)
+    crop = img_array[cy0:min(h, y_max + pad), crop_left:crop_right]
     readings = _ocr_numbers(crop, pt, horizontal=False)  # (crop_row, value)
 
     if len(readings) < 2:
         return None
 
-    calibration_pts = sorted((row + y_min, val) for row, val in readings)
+    calibration_pts = sorted((row + cy0, val) for row, val in readings)
     logger.info(
         f"Y OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(py)}" for py, val in calibration_pts)
     )
-    return _fit_axis(calibration_pts, y_min, y_max, "Y")
+    calib = _fit_axis(calibration_pts, y_min, y_max, "Y")
+    if debug is not None:
+        debug["y_ticks"] = _ticks_for_debug(calibration_pts, calib)
+    return calib
+
+
+def _ticks_for_debug(calibration_pts, calib):
+    """Return [(pixel, value, is_inlier)] — inlier = the label fits the fit line."""
+    if calib is None:
+        return [(int(p), v, False) for p, v in calibration_pts]
+    scale = calib[4] if len(calib) > 4 else "lin"
+    out = []
+    for p, v in calibration_pts:
+        model = pixel_to_data(p, calib)
+        if scale == "log" and v > 0 and model > 0:
+            ok = abs(math.log10(v) - math.log10(model)) <= 0.05
+        else:
+            span = abs(calib[3] - calib[1]) or 1.0
+            ok = abs(v - model) <= max(0.03 * span, 0.5)
+        out.append((int(round(p)), v, bool(ok)))
+    return out
 
 
 def _fit_axis(
@@ -152,7 +183,17 @@ def _fit_axis(
         # does *not* masquerade as log.
         log = _robust_line([(p, math.log10(v)) for p, v in pts], tol=0.05)
 
-    use_log = log is not None and (lin is None or len(log[2]) > len(lin[2]))
+    n_lin = len(lin[2]) if lin else 0
+    n_log = len(log[2]) if log else 0
+    # A positive axis whose ticks span more than ~1.7 decades is log — and with
+    # a huge value span the linear tolerance balloons so a log ladder can look
+    # "linear", so when ≥3 ticks are collinear in log space we trust log.
+    vals = [v for _, v in pts]
+    wide_range = all(v > 0 for _, v in pts) and (max(vals) / min(vals) > 50)
+    if log is not None and n_log >= 3 and (wide_range or n_log > n_lin):
+        use_log = True
+    else:
+        use_log = False
     fit = log if use_log else lin
     if fit is None:
         return None
@@ -240,34 +281,47 @@ def _ocr_numbers(
     if crop.shape[0] < 4 or crop.shape[1] < 4:
         return []
 
-    pil_img = PILImage.fromarray(crop)
-    scale = 3
-    pil_img = pil_img.resize(
-        (pil_img.width * scale, pil_img.height * scale), PILImage.LANCZOS
+    import re
+
+    # Binarise (dark ink → black on white) so small axis digits read reliably,
+    # then upscale.  Run two page-segmentation modes and merge: psm 6
+    # (uniform block) catches edge labels, psm 11 (sparse) separates crowded
+    # ones — RANSAC in the fit discards whatever disagrees.
+    gray = np.asarray(PILImage.fromarray(crop).convert("L"))
+    binary = np.where(gray < 128, 0, 255).astype(np.uint8)
+    scale = 4
+    pil_img = PILImage.fromarray(binary).resize(
+        (binary.shape[1] * scale, binary.shape[0] * scale), PILImage.LANCZOS
     )
 
-    try:
-        config = "--psm 11 -c tessedit_char_whitelist=0123456789.-eE+"
-        data = pt.image_to_data(pil_img, output_type=pt.Output.DICT, config=config)
-    except Exception as exc:
-        logger.error(f"OCR error: {exc}")
-        return []
-
+    num_re = re.compile(r"\d*\.?\d+")
     results: list[tuple[float, float]] = []
-    for i, text in enumerate(data["text"]):
-        text = text.strip()
-        if not text:
-            continue
+    for psm in (6, 11):
         try:
-            value = float(text)
-        except ValueError:
+            config = f"--psm {psm} -c tessedit_char_whitelist=0123456789.-eE+"
+            data = pt.image_to_data(pil_img, output_type=pt.Output.DICT, config=config)
+        except Exception as exc:
+            logger.error(f"OCR error: {exc}")
             continue
-        col_c = (data["left"][i] + data["width"][i] / 2) / scale
-        row_c = (data["top"][i] + data["height"][i] / 2) / scale
-        pos = col_c if horizontal else row_c
-        results.append((pos, value))
+        for i, text in enumerate(data["text"]):
+            m = num_re.search(text.strip())
+            if not m:
+                continue
+            try:
+                value = float(m.group())
+            except ValueError:
+                continue
+            col_c = (data["left"][i] + data["width"][i] / 2) / scale
+            row_c = (data["top"][i] + data["height"][i] / 2) / scale
+            pos = col_c if horizontal else row_c
+            results.append((pos, value))
 
-    return results
+    # Deduplicate near-identical (pos, value) from the two passes.
+    deduped: list[tuple[float, float]] = []
+    for pos, value in results:
+        if not any(abs(pos - p) < 6 and abs(value - v) < 1e-6 for p, v in deduped):
+            deduped.append((pos, value))
+    return deduped
 
 
 def _default_x(plot_area) -> Calibration:

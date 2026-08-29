@@ -132,14 +132,28 @@ def _segment_by_color(
 
     # Detect and suppress grid pixels before any further analysis
     arrows: list[dict] = []
+    bridge = np.zeros(canvas.shape[:2], dtype=bool)
     if has_grid:
-        grid_mask, arrows = _detect_grid(s, v, canvas.shape[:2], span_frac=span_frac)
+        grid_mask, arrows, bridge = _detect_grid(s, v, canvas.shape[:2], span_frac=span_frac)
         logger.info(f"Grid pixels suppressed: {int(grid_mask.sum())}")
     else:
         grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:
+        from .annotation_detector import (
+            detect_text_boxes, detect_legend_boxes, snap_labels_to_legend,
+            expand_to_white, ocr_boxes,
+        )
+        _ink = (s < 0.30) & (v < 0.90)
         debug["grid_mask"] = grid_mask
         debug["arrows"] = arrows
+        tboxes = detect_text_boxes(_ink)
+        legends = detect_legend_boxes(tboxes)
+        # Grow each legend to the true white-box edges (where the grid resumes).
+        legends = [expand_to_white(_ink, lg) for lg in legends]
+        tboxes = snap_labels_to_legend(tboxes, legends)
+        debug["text_boxes"] = tboxes
+        debug["legend_boxes"] = legends
+        debug["label_texts"] = ocr_boxes(canvas, tboxes)
 
     if target_colors:
         return _segment_by_target_colors(
@@ -167,7 +181,7 @@ def _segment_by_color(
         )
         return _segment_achromatic(
             s, v, grid_mask, w_px, total_pixels,
-            min_col_coverage, effective_min_px_frac,
+            min_col_coverage, effective_min_px_frac, bridge,
         )
 
     # Hue in [0, 360)
@@ -243,7 +257,7 @@ def _segment_by_color(
     # A thick black data line (v ≈ 0) is excluded from the gray range above.
     # After grid suppression, remaining dark ink in the plot area is the
     # curve itself (isolated text blobs fail the column-coverage test below).
-    black_fg = (s < 0.30) & (v < 0.25) & ~grid_mask
+    black_fg = ((s < 0.30) & (v < 0.25) & ~grid_mask) | bridge
     if black_fg.sum() >= total_pixels * effective_min_px_frac:
         col_profile = black_fg.any(axis=0)
         if col_profile.sum() >= w_px * min_col_coverage:
@@ -310,6 +324,7 @@ def _segment_achromatic(
     total_pixels: int,
     min_col_coverage: float,
     effective_min_px_frac: float,
+    bridge: Optional[np.ndarray] = None,
 ) -> dict[str, np.ndarray]:
     """
     Extract a single dark data line from a black/white (achromatic) plot.
@@ -322,6 +337,8 @@ def _segment_achromatic(
     masks: dict[str, np.ndarray] = {}
     for v_thresh in (0.25, 0.40, 0.55):
         bin_mask = (s < 0.35) & (v < v_thresh) & ~grid_mask
+        if bridge is not None:
+            bin_mask = bin_mask | bridge   # synthetic arrowhead connectors
         if bin_mask.sum() < total_pixels * effective_min_px_frac:
             continue
         if bin_mask.any(axis=0).sum() < w_px * min_col_coverage:
@@ -423,8 +440,10 @@ def _detect_grid(
     # horizontal distractor that derails the tracer.  Detect and suppress
     # the shafts; the reclaim below then reconnects each curve across them.
     arrows = _detect_arrows(ink & ~grid_mask, w, h)
+    arrow_px = np.zeros((h, w), dtype=bool)
     for a in arrows:
         grid_mask |= a["shaft_mask"]
+        arrow_px |= a["shaft_mask"]
 
     # --- Reclaim curve pixels the grid removal punched out --------------
     # Subtracting a grid line (or arrow shaft) leaves a small hole wherever
@@ -434,7 +453,46 @@ def _detect_grid(
     # crossings.  (Pure grid/shaft pixels have curve ink on neither side.)
     grid_mask &= ~_bridge_reclaim(ink & ~grid_mask, grid_mask, reach=5)
 
-    return grid_mask, arrows
+    # Suppressing the head leaves a blank gap in the curve it points at.  Draw a
+    # thin synthetic connector across that gap (there is no ink left to reclaim)
+    # so the curve stays continuous and the tracer runs straight through.
+    bridge = _bridge_arrow_heads(ink & ~grid_mask, arrows, grid_mask.shape) \
+        if arrows else np.zeros((h, w), dtype=bool)
+    grid_mask &= ~bridge
+
+    return grid_mask, arrows, bridge
+
+
+def _bridge_arrow_heads(curve: np.ndarray, arrows: list[dict],
+                        shape: tuple[int, int]) -> np.ndarray:
+    """
+    Draw a thin vertical connector through each arrowhead: locate the curve the
+    arrow points at just above and below the head, and re-enable a 2 px strip
+    on the straight line between them.  This keeps that curve continuous without
+    re-adding the wide head blob.
+    """
+    h, w = shape
+    out = np.zeros((h, w), dtype=bool)
+    for a in arrows:
+        row, tip = a["row"], a["tip_x"]
+        ya, yb = row - 18, row + 18
+        ends = []
+        for probe in (ya, yb):
+            if not (0 <= probe < h):
+                ends.append(None)
+                continue
+            xs = np.where(curve[probe])[0]
+            near = xs[np.abs(xs - tip) <= 20]
+            ends.append(int(near[np.argmin(np.abs(near - tip))]) if near.size else None)
+        if ends[0] is None or ends[1] is None:
+            continue
+        n = yb - ya + 1
+        line_x = np.linspace(ends[0], ends[1], n)
+        line_y = np.linspace(ya, yb, n)
+        for xx, yy in zip(line_x, line_y):
+            ri, ci = int(round(yy)), int(round(xx))
+            out[max(0, ri - 1):ri + 2, max(0, ci - 1):ci + 2] = True
+    return out
 
 
 def _bridge_reclaim(curve: np.ndarray, grid_mask: np.ndarray, reach: int = 5) -> np.ndarray:
@@ -511,6 +569,9 @@ def _detect_arrows(curve: np.ndarray, w: int, h: int) -> list[dict]:
         # Suppress the shaft (thin horizontal ink over its span) plus the dense
         # arrowhead blob near the tip.  The thin (non-dense) vertical curve that
         # the shaft crosses or the head points at is left intact.
+        # Suppress the thin-horizontal shaft ink over its span plus the dense
+        # arrowhead blob near the tip.  The vertical data curves have a large
+        # vertical run, are not in `hseg`, and survive untouched.
         band = np.zeros_like(curve)
         band[max(0, row - 4):row + 5, x_from:x_to + 1] = True
         head = np.zeros_like(curve)
@@ -775,10 +836,111 @@ def _extract_trace(
 
         arr[:, 0] += x_offset
         arr[:, 1] += y_offset
-        paths.append(arr)
+        arr = _clean_path(arr, width)
+        # Curvature-adaptive density: ~TARGET_DENSITY points across the canvas
+        # width where the curve bends, up to 3× sparser on straight runs.
+        base_step = mask.shape[1] / _TARGET_DENSITY
+        paths.append(_adaptive_resample(arr, base_step))
 
     paths.sort(key=len, reverse=True)
     return paths
+
+
+_TARGET_DENSITY = 100  # base points across the canvas width (curvy regions)
+
+
+def _adaptive_resample(path: np.ndarray, base_step: float,
+                       max_factor: float = 3.0) -> np.ndarray:
+    """
+    Resample a curve so point spacing follows its curvature: ≈ base_step where
+    the curve bends, growing up to max_factor·base_step on straight runs (so a
+    ruler-straight, steep segment carries few points and no lateral pendulum).
+    """
+    if len(path) < 3 or base_step <= 0:
+        return path
+    seg = np.diff(path, axis=0)
+    seglen = np.hypot(seg[:, 0], seg[:, 1])
+    s = np.concatenate([[0.0], np.cumsum(seglen)])
+    L = float(s[-1])
+    if L <= base_step:
+        return np.vstack([path[0], path[-1]])
+
+    def at(q: float) -> np.ndarray:
+        i = int(np.searchsorted(s, q) - 1)
+        i = min(max(i, 0), len(seglen) - 1)
+        t = (q - s[i]) / (seglen[i] if seglen[i] > 1e-9 else 1.0)
+        return path[i] + t * (path[i + 1] - path[i])
+
+    def straightness(q: float) -> float:
+        a, b = max(0.0, q - base_step), min(L, q + base_step)
+        pa, pb = at(a), at(b)
+        arc = b - a
+        return float(np.hypot(*(pb - pa)) / arc) if arc > 1e-9 else 1.0
+
+    out = [path[0]]
+    pos = 0.0
+    while pos < L:
+        sigma = straightness(pos)                 # 1 = straight, <1 = curvy
+        grow = np.clip((sigma - 0.9) / 0.1, 0.0, 1.0)
+        pos += base_step * (1.0 + (max_factor - 1.0) * grow)
+        if pos < L:
+            out.append(at(pos))
+    out.append(path[-1])
+    return np.array(out)
+
+
+def _clean_path(path: np.ndarray, width: float) -> np.ndarray:
+    """
+    Stabilise a traced curve so it reads as the *function* it is:
+
+    (1) A rolling-median filter (window 5) along the arc removes the lateral
+        oscillation the beaded tube produces on steep, near-vertical segments —
+        there the x-position must not pendulum back and forth.  Median (not
+        mean) keeps genuine corners (e.g. the BAT46GW knee) sharp.
+    (2) A short sharp hook at either end (crossing/arrow artefact) is trimmed.
+
+    This corrects the trace along its own arc; it does not resample per x-column
+    (which was the multivalued failure the tracer was built to avoid).
+    """
+    if len(path) < 7:
+        return path
+
+    from scipy.signal import savgol_filter
+
+    n = len(path)
+    med = path.copy()
+    k = 2  # half-window → length-5 median (kills spikes, keeps corners)
+    for i in range(k, n - k):
+        med[i, 0] = np.median(path[i - k:i + k + 1, 0])
+        med[i, 1] = np.median(path[i - k:i + k + 1, 1])
+
+    # Savitzky-Golay (quadratic, window 7) removes residual lateral jitter while
+    # a local quadratic keeps genuine corners (e.g. the BAT46GW knee) sharp.
+    win = 7 if n >= 7 else (n if n % 2 else n - 1)
+    out = med.copy()
+    if win >= 5:
+        out[:, 0] = savgol_filter(med[:, 0], win, 2)
+        out[:, 1] = savgol_filter(med[:, 1], win, 2)
+
+    def _turn(a, b, c):
+        u, v = b - a, c - b
+        nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+        if nu < 1e-6 or nv < 1e-6:
+            return 0.0
+        return float(np.degrees(np.arccos(np.clip(u.dot(v) / (nu * nv), -1, 1))))
+
+    lo_i, hi_i = 0, len(out)
+    for _ in range(3):
+        if hi_i - lo_i >= 5 and _turn(out[hi_i - 3], out[hi_i - 2], out[hi_i - 1]) > 70:
+            hi_i -= 1
+        else:
+            break
+    for _ in range(3):
+        if hi_i - lo_i >= 5 and _turn(out[lo_i], out[lo_i + 1], out[lo_i + 2]) > 70:
+            lo_i += 1
+        else:
+            break
+    return out[lo_i:hi_i]
 
 
 def _local_direction(tree, coords, seed, radius) -> np.ndarray:

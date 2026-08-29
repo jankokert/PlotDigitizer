@@ -27,6 +27,11 @@ _FALLBACK_PALETTE = [
 ]
 
 
+def _xml_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def _image_data_uri(image_path: Path) -> tuple[str, int, int]:
     """Return (data-URI, width, height) for the source image."""
     from PIL import Image
@@ -81,6 +86,12 @@ def write_debug_svg(
     plot_area: tuple[int, int, int, int],
     curves: dict[str, np.ndarray],
     grid_mask: Optional[np.ndarray] = None,
+    arrows: Optional[list[dict]] = None,
+    text_boxes: Optional[list[tuple[int, int, int, int]]] = None,
+    legend_boxes: Optional[list[tuple[int, int, int, int]]] = None,
+    label_texts: Optional[list[str]] = None,
+    x_ticks: Optional[list[tuple[int, float, bool]]] = None,
+    y_ticks: Optional[list[tuple[int, float, bool]]] = None,
 ) -> None:
     """Write the debug SVG to out_path.
 
@@ -90,6 +101,8 @@ def write_debug_svg(
         plot_area:  (x_min, y_min, x_max, y_max) in image pixel coords.
         curves:     {label: Nx2 array of (px, py)} in image pixel coords.
         grid_mask:  optional canvas-relative bool mask of suppressed pixels.
+        arrows:     optional list of detected annotation-arrow dicts
+                    (canvas-relative row / x_from / x_to / tip_x / tip_dir).
     """
     data_uri, w, h = _image_data_uri(image_path)
     x_min, y_min, x_max, y_max = plot_area
@@ -113,6 +126,74 @@ def write_debug_svg(
         f'height="{y_max - y_min}" fill="none" stroke="#00c000" '
         f'stroke-width="2"/>'
     )
+
+    # OCR'd axis ticks: inliers (used in the fit) green, rejected outliers red.
+    for (px, val, ok) in (x_ticks or []):
+        col = "#00a000" if ok else "#d02020"
+        parts.append(
+            f'<line x1="{px}" y1="{y_max}" x2="{px}" y2="{y_max + 9}" '
+            f'stroke="{col}" stroke-width="2"/>'
+        )
+        parts.append(
+            f'<text x="{px}" y="{y_max + 22}" font-size="11" fill="{col}" '
+            f'text-anchor="middle">{val:g}</text>'
+        )
+    for (py, val, ok) in (y_ticks or []):
+        col = "#00a000" if ok else "#d02020"
+        parts.append(
+            f'<line x1="{x_min - 9}" y1="{py}" x2="{x_min}" y2="{py}" '
+            f'stroke="{col}" stroke-width="2"/>'
+        )
+        parts.append(
+            f'<text x="{x_min - 12}" y="{py + 4}" font-size="11" fill="{col}" '
+            f'text-anchor="end">{val:g}</text>'
+        )
+
+    # Detected annotation arrows (shaft line + arrowhead), in cyan.
+    for a in (arrows or []):
+        ay = a["row"] + y_min
+        x_tail = a["tail_x"] + x_min
+        x_tip = a["tip_x"] + x_min
+        d = a["tip_dir"]
+        parts.append(
+            f'<line x1="{x_tail}" y1="{ay}" x2="{x_tip}" y2="{ay}" '
+            f'stroke="#00b8d4" stroke-width="1.6" opacity="0.95"/>'
+        )
+        # Arrowhead triangle pointing along tip_dir.
+        hx = x_tip + d * 9
+        parts.append(
+            f'<polygon points="{x_tip},{ay} {hx},{ay - 5} {hx},{ay + 5}" '
+            f'fill="#00b8d4" opacity="0.95"/>'
+        )
+
+    # Detected legend region (encloses stacked labels), in solid purple.
+    for (lx0, ly0, lx1, ly1) in (legend_boxes or []):
+        parts.append(
+            f'<rect x="{lx0 + x_min}" y="{ly0 + y_min}" '
+            f'width="{lx1 - lx0}" height="{ly1 - ly0}" fill="#7b1fa2" '
+            f'fill-opacity="0.10" stroke="#7b1fa2" stroke-width="2.4"/>'
+        )
+        parts.append(
+            f'<text x="{lx0 + x_min}" y="{ly0 + y_min - 4}" font-size="12" '
+            f'fill="#7b1fa2" font-weight="bold">legend</text>'
+        )
+
+    # Detected text-label boxes (canvas-relative), in magenta, annotated with
+    # the OCR reading when available.
+    for i, (bx0, by0, bx1, by1) in enumerate(text_boxes or []):
+        reading = ""
+        if label_texts and i < len(label_texts) and label_texts[i]:
+            reading = label_texts[i]
+        caption = reading if reading else "text"
+        parts.append(
+            f'<rect x="{bx0 + x_min}" y="{by0 + y_min}" '
+            f'width="{bx1 - bx0}" height="{by1 - by0}" fill="none" '
+            f'stroke="#d400aa" stroke-width="1.8" stroke-dasharray="4,2"/>'
+        )
+        parts.append(
+            f'<text x="{bx0 + x_min}" y="{by0 + y_min - 2}" font-size="12" '
+            f'fill="#d400aa" font-weight="bold">{_xml_escape(caption)}</text>'
+        )
 
     # Curve points
     legend: list[str] = []

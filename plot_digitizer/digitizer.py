@@ -56,12 +56,12 @@ def digitize_plot(
     logger.info(f"Canvas: {canvas_w}x{canvas_h} px  ({x_min},{y_min})→({x_max},{y_max})")
 
     # 3. Read axis calibration
+    debug: Optional[dict] = {} if debug_svg else None
     x_calib, y_calib = read_axes(
-        img_array, plot_area, x_range=x_range, y_range=y_range
+        img_array, plot_area, x_range=x_range, y_range=y_range, debug=debug
     )
 
     # 4. Extract curves
-    debug: Optional[dict] = {} if debug_svg else None
     curves = extract_curves(
         img_array, plot_area,
         method=method, smoothing=smoothing,
@@ -88,6 +88,12 @@ def digitize_plot(
             plot_area=plot_area,
             curves=curves,
             grid_mask=(debug or {}).get("grid_mask"),
+            arrows=(debug or {}).get("arrows"),
+            text_boxes=(debug or {}).get("text_boxes"),
+            legend_boxes=(debug or {}).get("legend_boxes"),
+            label_texts=(debug or {}).get("label_texts"),
+            x_ticks=(debug or {}).get("x_ticks"),
+            y_ticks=(debug or {}).get("y_ticks"),
         )
 
     # 5. Convert pixel → data coordinates and collect rows
