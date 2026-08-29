@@ -90,6 +90,7 @@ def write_debug_svg(
     text_boxes: Optional[list[tuple[int, int, int, int]]] = None,
     legend_boxes: Optional[list[tuple[int, int, int, int]]] = None,
     label_texts: Optional[list[str]] = None,
+    label_arrows: Optional[list[dict]] = None,
     x_ticks: Optional[list[tuple[int, float, bool]]] = None,
     y_ticks: Optional[list[tuple[int, float, bool]]] = None,
 ) -> None:
@@ -164,6 +165,25 @@ def write_debug_svg(
         parts.append(
             f'<polygon points="{x_tip},{ay} {hx},{ay - 5} {hx},{ay + 5}" '
             f'fill="#00b8d4" opacity="0.95"/>'
+        )
+
+    # Annotation arrows detected via OCR label + solid arrowhead (orange):
+    # shaft from the label (tail) to the tip resting on the curve, plus the
+    # OCR'd series label at the tail.
+    for a in (label_arrows or []):
+        tlx, tly = a["tail_x"] + x_min, a["tail_y"] + y_min
+        tpx, tpy = a["tip_x"] + x_min, a["tip_y"] + y_min
+        parts.append(
+            f'<line x1="{tlx}" y1="{tly}" x2="{tpx}" y2="{tpy}" '
+            f'stroke="#ff6f00" stroke-width="2" opacity="0.95"/>'
+        )
+        parts.append(
+            f'<circle cx="{tpx}" cy="{tpy}" r="4" fill="#ff6f00" '
+            f'stroke="#7a3400" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<text x="{tlx + 3}" y="{tly - 3}" font-size="11" fill="#ff6f00" '
+            f'font-weight="bold">{_xml_escape(a.get("label", ""))}</text>'
         )
 
     # Detected legend region (encloses stacked labels), in solid purple.

@@ -92,6 +92,7 @@ def digitize_plot(
             text_boxes=(debug or {}).get("text_boxes"),
             legend_boxes=(debug or {}).get("legend_boxes"),
             label_texts=(debug or {}).get("label_texts"),
+            label_arrows=(debug or {}).get("label_arrows"),
             x_ticks=(debug or {}).get("x_ticks"),
             y_ticks=(debug or {}).get("y_ticks"),
         )

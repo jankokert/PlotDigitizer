@@ -140,18 +140,22 @@ def _segment_by_color(
         grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:
         from .annotation_detector import (
-            detect_text_boxes, detect_legend_boxes, snap_labels_to_legend,
-            expand_to_white, ocr_boxes, detect_grid_boxes,
+            detect_legend_boxes, expand_to_white, detect_grid_boxes,
+            detect_text_labels_ocr, detect_arrows,
         )
         _ink = (s < 0.30) & (v < 0.90)
         debug["grid_mask"] = grid_mask
         debug["arrows"] = arrows
-        tboxes = detect_text_boxes(_ink)
-        legends = detect_legend_boxes(tboxes)
-        # Grow each legend to the true white-box edges (where the grid resumes).
-        legends = [expand_to_white(_ink, lg) for lg in legends]
-        tboxes = snap_labels_to_legend(tboxes, legends)
-        label_texts = ocr_boxes(canvas, tboxes)
+        # Annotation arrows via OCR labels + solid arrowheads (general, diagonal).
+        _ocr_labels = detect_text_labels_ocr(canvas)
+        debug["label_arrows"] = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        # Text-label boxes = clean OCR word boxes (glyph clustering merged whole
+        # label rows into bogus mega-boxes; word OCR gives one tight box each).
+        tboxes = [lab["box"] for lab in _ocr_labels]
+        label_texts = [lab["text"] for lab in _ocr_labels]
+        # A legend is a genuine vertical stack of aligned labels (USFF 0.05–0.25
+        # A); scattered callouts yield none. Grow it to the white-box edges.
+        legends = [expand_to_white(_ink, lg) for lg in detect_legend_boxes(tboxes)]
         # Arrow-less notes on a white patch (e.g. "f=1.0MHz") are found by the
         # hole they punch in the grid, and come with their OCR reading already.
         for gbox, gtext in detect_grid_boxes(canvas, span_frac=span_frac):

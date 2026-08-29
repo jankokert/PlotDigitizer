@@ -115,10 +115,19 @@ def detect_legend_boxes(
     for members in groups.values():
         if len(members) < 2:
             continue
-        xs0 = min(text_boxes[m][0] for m in members)
-        ys0 = min(text_boxes[m][1] for m in members)
-        xs1 = max(text_boxes[m][2] for m in members)
-        ys1 = max(text_boxes[m][3] for m in members)
+        mb = [text_boxes[m] for m in members]
+        # A real legend is a vertical STACK: the members' left edges are aligned
+        # (small x-spread) and they sit at distinct y. Scattered callout labels
+        # (e.g. CMZ5334B…5350B spread across the top) chain via x-overlap but are
+        # NOT aligned, so reject them to avoid huge bogus "legend" rectangles.
+        lefts = [b[0] for b in mb]
+        med_w = sorted(b[2] - b[0] for b in mb)[len(mb) // 2]
+        if max(lefts) - min(lefts) > 0.4 * med_w:
+            continue
+        xs0 = min(b[0] for b in mb); ys0 = min(b[1] for b in mb)
+        xs1 = max(b[2] for b in mb); ys1 = max(b[3] for b in mb)
+        if ys1 - ys0 <= xs1 - xs0:      # a stack is taller than it is wide
+            continue
         legends.append((xs0, ys0, xs1, ys1))
     return legends
 
@@ -234,6 +243,210 @@ def detect_grid_boxes(
         if len(text.replace(" ", "")) >= 2:
             results.append((box, text))
     return results
+
+
+def detect_text_labels_ocr(
+    canvas_rgb: np.ndarray,
+    min_len: int = 4,
+    min_conf: int = 30,
+) -> list[dict]:
+    """
+    Read word-level text labels with OCR (``image_to_data``), returning one dict
+    per word: ``{text, box=(x0,y0,x1,y1), conf}`` in canvas pixel coords.
+
+    Word-level OCR gives clean per-label boxes for the crisp series labels on
+    datasheet plots ("CMZ5334B", "0.050 A") — far more reliable than clustering
+    glyph blobs, and it is the anchor the arrow detector builds on.
+    """
+    try:
+        import pytesseract as pt
+        from PIL import Image as PILImage
+    except Exception:
+        return []
+    data = pt.image_to_data(PILImage.fromarray(canvas_rgb.astype(np.uint8)),
+                            config="--psm 11", output_type=pt.Output.DICT)
+    out = []
+    for i, t in enumerate(data["text"]):
+        t = t.strip()
+        try:
+            conf = int(float(data["conf"][i]))
+        except (ValueError, TypeError):
+            conf = -1
+        if len(t) >= min_len and conf >= min_conf:
+            L, T = int(data["left"][i]), int(data["top"][i])
+            R, B = L + int(data["width"][i]), T + int(data["height"][i])
+            out.append({"text": t, "box": (L, T, R, B), "conf": conf})
+    return out
+
+
+def detect_arrows(
+    canvas_rgb: np.ndarray,
+    grid_mask: np.ndarray,
+    labels: Optional[list[dict]] = None,
+    match_radius: int = 200,
+) -> list[dict]:
+    """
+    Detect annotation arrows by pairing OCR text labels with solid arrowheads.
+
+    A datasheet callout is a text label plus an arrow whose **solid triangular
+    head** touches the curve it names.  The head is the one robust, general cue:
+    unlike the thin shaft (which may lie on a grid line and vanish with the grid)
+    it is a compact *fat* ink blob, detectable in any orientation — so this works
+    for diagonal arrows and varied heads.
+
+    Method: remove the grid, find compact thick-ink cores (arrowhead candidates,
+    telling them from elongated curve bodies by shape), then greedily match each
+    OCR label to its nearest head.  The **tip** is the head pixel farthest from
+    the label (the apex resting on the curve = the arrow's end / the point that
+    identifies the curve); the **tail** is the label-box point nearest the tip.
+
+    Returns dicts ``{label, tail_x, tail_y, tip_x, tip_y, head_box}`` in canvas
+    pixel coords.  Two detectors run in order: solid-arrowhead matching (general,
+    diagonal), then — only for labels it left unmatched — a horizontal on-grid
+    shaft tracer (the USFF case: shafts lie on grid lines and vanish with the
+    grid, but the label anchors a leftward trace to the solid head).  A label
+    matched by neither yields no arrow (a missing arrow beats a wrong one).
+    """
+    from scipy import ndimage
+    from .curve_extractor import _run_length
+
+    r = canvas_rgb[:, :, 0] / 255.0
+    g = canvas_rgb[:, :, 1] / 255.0
+    b = canvas_rgb[:, :, 2] / 255.0
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    v = max_c
+    s = np.where(max_c > 1e-6, (max_c - min_c) / np.where(max_c > 1e-6, max_c, 1.0), 0.0)
+    ink = (s < 0.30) & (v < 0.90)
+    fg = ink & ~grid_mask
+
+    if labels is None:
+        labels = detect_text_labels_ocr(canvas_rgb)
+    if not labels:
+        return []
+
+    # Arrowhead candidates: compact fat cores (survive erosion by ~3 px), and
+    # compact (curve bodies erode to long thin cores, so shape rejects them).
+    dist = ndimage.distance_transform_edt(fg)
+    lbl, n = ndimage.label(dist >= 3.25)
+    heads = []
+    for i in range(1, n + 1):
+        ys, xs = np.where(lbl == i)
+        bw, bh = int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1
+        if (len(xs) < 8 or max(bw, bh) > 22 or min(bw, bh) < 3
+                or max(bw, bh) > 3.5 * min(bw, bh)):
+            continue
+        heads.append({"cx": int(xs.mean()), "cy": int(ys.mean()),
+                      "xs": xs, "ys": ys,
+                      "box": (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))})
+
+    arrows: list[dict] = []
+    used: set[int] = set()
+    matched_labels: set[int] = set()
+    for li, lab in enumerate(labels):
+        lx0, ly0, lx1, ly1 = lab["box"]
+        acx, acy = (lx0 + lx1) // 2, (ly0 + ly1) // 2
+        best, best_d = None, match_radius ** 2
+        for j, hd in enumerate(heads):
+            if j in used:
+                continue
+            d2 = (hd["cx"] - acx) ** 2 + (hd["cy"] - acy) ** 2
+            if d2 < best_d:
+                best_d, best = d2, j
+        if best is None:
+            continue
+        used.add(best)
+        matched_labels.add(li)
+        hd = heads[best]
+        k = int(np.argmax((hd["xs"] - acx) ** 2 + (hd["ys"] - acy) ** 2))
+        tip_x, tip_y = int(hd["xs"][k]), int(hd["ys"][k])
+        tail_x = min(max(tip_x, lx0), lx1)
+        tail_y = min(max(tip_y, ly0), ly1)
+        arrows.append({"label": lab["text"],
+                       "tail_x": tail_x, "tail_y": tail_y,
+                       "tip_x": tip_x, "tip_y": tip_y,
+                       "head_box": hd["box"]})
+
+    # Horizontal on-grid fallback for labels without a solid diagonal head — but
+    # only for labels that form a LEGEND (a vertical stack, e.g. USFF 0.05–0.25
+    # A). Horizontal callout arrows are a legend pattern; restricting to it keeps
+    # a lone scattered label from latching onto a bold grid line as a "shaft".
+    legends = detect_legend_boxes([lab["box"] for lab in labels])
+
+    def _in_legend(box):
+        for lx0, ly0, lx1, ly1 in legends:
+            if (box[0] >= lx0 - 4 and box[2] <= lx1 + 4
+                    and box[1] >= ly0 - 4 and box[3] <= ly1 + 4):
+                return True
+        return False
+
+    unmatched = [labels[i] for i in range(len(labels))
+                 if i not in matched_labels and _in_legend(labels[i]["box"])]
+    if unmatched:
+        h_img, w_img = ink.shape
+        vrun = _run_length(ink, axis=0)
+        bold = ink & (vrun >= 3)                    # bolder than a thin grid line
+        label_zone = np.zeros_like(ink)
+        for lab in labels:                          # a neighbour's glyphs are not a shaft
+            a, bb, c, dd = lab["box"]
+            label_zone[max(0, bb - 2):min(h_img, dd + 2),
+                       max(0, a - 2):min(w_img, c + 2)] = True
+        bold_m = bold & ~label_zone
+        ink_m = ink & ~label_zone
+        for lab in unmatched:
+            arr = _trace_horizontal_arrow(lab, ink_m, bold_m)
+            if arr is not None:
+                arrows.append(arr)
+    return arrows
+
+
+def _trace_horizontal_arrow(lab: dict, ink_m: np.ndarray, bold_m: np.ndarray,
+                            half_band: int = 7) -> Optional[dict]:
+    """
+    Trace a horizontal callout arrow that points LEFT from a right-side label to
+    its curve (the USFF case).  The shaft lies on a grid line, so instead of the
+    (grid-removed) shaft we locate the solid arrowhead: the arrow row is the band
+    row carrying the most bold ink left of the label; the tip is the leftmost
+    *wide* thickness run (the triangular head ~8 px, vs 1–2 px grid crossings).
+
+    Returns an arrow dict or None.  Gated on span>=40 and a head thickness peak
+    >=10 so grid/curve crossings don't masquerade as arrows.
+    """
+    h_img, w_img = ink_m.shape
+    lx0, ly0, lx1, ly1 = lab["box"]
+    yc = (ly0 + ly1) // 2
+    y_lo, y_hi = max(1, yc - 9), min(h_img - 1, yc + 10)
+    counts = [(int(bold_m[yy, 0:lx0].sum()), yy) for yy in range(y_lo, y_hi)]
+    cnt, row = max(counts)
+    if cnt < 25:
+        return None
+    thick = ink_m[row - half_band:row + half_band + 1, 0:lx0].sum(axis=0)
+    wide = np.where(thick >= 8)[0]
+    if len(wide) == 0:
+        return None
+    # leftmost run of >=4 consecutive wide columns = the arrowhead
+    runs = []
+    start = prev = wide[0]
+    for xi in wide[1:]:
+        if xi == prev + 1:
+            prev = xi
+        else:
+            if prev - start + 1 >= 4:
+                runs.append((start, prev))
+            start = prev = xi
+    if prev - start + 1 >= 4:
+        runs.append((start, prev))
+    if not runs:
+        return None
+    hs, he = min(runs)
+    span = lx0 - hs
+    peak = int(thick[hs:he + 1].max())
+    if span < 40 or peak < 10:
+        return None
+    return {"label": lab["text"],
+            "tail_x": min(max(hs, lx0), lx1), "tail_y": yc,
+            "tip_x": int(hs), "tip_y": int(row),
+            "head_box": (int(hs), int(row - half_band), int(he), int(row + half_band))}
 
 
 def ocr_boxes(
