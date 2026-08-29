@@ -1,13 +1,16 @@
 """Read numeric axis labels from the plot image using OCR (pytesseract)."""
 
 import logging
+import math
 from typing import Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Calibration: (pixel_low, value_low, pixel_high, value_high)
-Calibration = tuple[float, float, float, float]
+# Calibration: (pixel_low, m_low, pixel_high, m_high, scale) where m is the data
+# value on a "lin" axis or log10(value) on a "log" axis.  A legacy 4-tuple
+# (no scale) is treated as linear.
+Calibration = tuple
 
 
 def read_axes(
@@ -25,7 +28,7 @@ def read_axes(
     x_min, y_min, x_max, y_max = plot_area
 
     if x_range is not None:
-        x_calib: Calibration = (x_min, x_range[0], x_max, x_range[1])
+        x_calib: Calibration = (x_min, x_range[0], x_max, x_range[1], "lin")
         logger.info(f"X axis: manual range {x_range}")
     else:
         x_calib = _read_x_axis(img_array, plot_area) or _default_x(plot_area)
@@ -33,7 +36,7 @@ def read_axes(
     if y_range is not None:
         # pixel y increases downward; data y increases upward
         # y_range = (y_min_value, y_max_value) — min at bottom, max at top
-        y_calib: Calibration = (y_min, y_range[1], y_max, y_range[0])
+        y_calib: Calibration = (y_min, y_range[1], y_max, y_range[0], "lin")
         logger.info(f"Y axis: manual range {y_range}")
     else:
         y_calib = _read_y_axis(img_array, plot_area) or _default_y(plot_area)
@@ -43,18 +46,27 @@ def read_axes(
     x_hi = pixel_to_data(x_max, x_calib)
     y_bot = pixel_to_data(y_max, y_calib)   # bottom pixel row
     y_top = pixel_to_data(y_min, y_calib)   # top pixel row
-    logger.info("--- Axis calibration (LINEAR only; log/semi-log not yet handled) ---")
-    logger.info(f"  X: data {x_lo:g} … {x_hi:g}   (calib {x_calib})")
-    logger.info(f"  Y: data {y_bot:g} (bottom) … {y_top:g} (top)   (calib {y_calib})")
+    x_scale = x_calib[4] if len(x_calib) > 4 else "lin"
+    y_scale = y_calib[4] if len(y_calib) > 4 else "lin"
+    logger.info("--- Axis calibration ---")
+    logger.info(f"  X ({x_scale}): data {x_lo:g} … {x_hi:g}")
+    logger.info(f"  Y ({y_scale}): data {y_bot:g} (bottom) … {y_top:g} (top)")
     return x_calib, y_calib
 
 
 def pixel_to_data(px: float, calib: Calibration) -> float:
-    """Linearly map a pixel coordinate to a data value."""
-    p_low, v_low, p_high, v_high = calib
+    """
+    Map a pixel coordinate to a data value.  Linear by default; if the
+    calibration carries scale == "log", the stored endpoints are log10(value)
+    and the result is exponentiated back.
+    """
+    p_low, m_low, p_high, m_high = calib[0], calib[1], calib[2], calib[3]
+    scale = calib[4] if len(calib) > 4 else "lin"
     if p_high == p_low:
-        return v_low
-    return v_low + (px - p_low) * (v_high - v_low) / (p_high - p_low)
+        m = m_low
+    else:
+        m = m_low + (px - p_low) * (m_high - m_low) / (p_high - p_low)
+    return 10.0 ** m if scale == "log" else m
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +106,7 @@ def _read_x_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
         f"X OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(px)}" for px, val in calibration_pts)
     )
-    fit = _robust_line(calibration_pts)
-    if fit is None:
-        return None
-    slope, intercept, kept = fit
-    if len(kept) < len(calibration_pts):
-        dropped = [f"{v:g}@px{int(p)}" for p, v in calibration_pts if (p, v) not in kept]
-        logger.info(f"X fit: rejected outlier label(s) {', '.join(dropped)}")
-    # Evaluate the fitted line at the plot-box edges for a full-span calibration.
-    return (x_min, slope * x_min + intercept, x_max, slope * x_max + intercept)
+    return _fit_axis(calibration_pts, x_min, x_max, "X")
 
 
 def _read_y_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
@@ -127,18 +131,46 @@ def _read_y_axis(img_array: np.ndarray, plot_area) -> Optional[Calibration]:
         f"Y OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(py)}" for py, val in calibration_pts)
     )
-    fit = _robust_line(calibration_pts)
+    return _fit_axis(calibration_pts, y_min, y_max, "Y")
+
+
+def _fit_axis(
+    pts: list[tuple[float, float]], p_lo: float, p_hi: float, name: str
+) -> Optional[Calibration]:
+    """
+    Fit an axis calibration from OCR ticks, auto-detecting linear vs log10.
+
+    Ticks are collinear against the pixel position in *value* space on a linear
+    axis and in *log10(value)* space on a log axis.  We robustly fit both and
+    keep whichever the ticks support better (more inliers), then evaluate the
+    fitted line at the plot-box edges.  Returns a 5-tuple calibration or None.
+    """
+    lin = _robust_line(pts)
+    log = None
+    if len(pts) >= 3 and all(v > 0 for _, v in pts):
+        # 0.05 in log10 ≈ 12 % value error — tight enough that a linear axis
+        # does *not* masquerade as log.
+        log = _robust_line([(p, math.log10(v)) for p, v in pts], tol=0.05)
+
+    use_log = log is not None and (lin is None or len(log[2]) > len(lin[2]))
+    fit = log if use_log else lin
     if fit is None:
         return None
     slope, intercept, kept = fit
-    if len(kept) < len(calibration_pts):
-        dropped = [f"{v:g}@px{int(p)}" for p, v in calibration_pts if (p, v) not in kept]
-        logger.info(f"Y fit: rejected outlier label(s) {', '.join(dropped)}")
-    return (y_min, slope * y_min + intercept, y_max, slope * y_max + intercept)
+    scale = "log" if use_log else "lin"
+
+    if len(kept) < len(pts):
+        kept_px = {p for p, _ in kept}
+        dropped = [f"{v:g}@px{int(p)}" for p, v in pts if p not in kept_px]
+        logger.info(f"{name} fit: rejected outlier label(s) {', '.join(dropped)}")
+    logger.info(f"{name} axis scale detected: {scale} ({len(kept)}/{len(pts)} ticks)")
+
+    return (p_lo, slope * p_lo + intercept, p_hi, slope * p_hi + intercept, scale)
 
 
 def _robust_line(
     points: list[tuple[float, float]],
+    tol: Optional[float] = None,
 ) -> Optional[tuple[float, float, list[tuple[float, float]]]]:
     """
     Fit value = slope * pixel + intercept through OCR tick labels, iteratively
@@ -166,7 +198,8 @@ def _robust_line(
     # subset. Axis ticks are exactly collinear, so the true line wins.
     vals = [v for _, v in pts]
     span = max(vals) - min(vals)
-    tol = max(0.02 * span, 0.5)  # data-units a label may deviate and still count
+    if tol is None:
+        tol = max(0.02 * span, 0.5)  # data-units a label may deviate and still count
 
     best_inliers: list[tuple[float, float]] = []
     best_err = float("inf")
@@ -240,10 +273,10 @@ def _ocr_numbers(
 def _default_x(plot_area) -> Calibration:
     x_min, _, x_max, _ = plot_area
     logger.warning("X axis: OCR failed — defaulting to [0, 1]")
-    return (x_min, 0.0, x_max, 1.0)
+    return (x_min, 0.0, x_max, 1.0, "lin")
 
 
 def _default_y(plot_area) -> Calibration:
     _, y_min, _, y_max = plot_area
     logger.warning("Y axis: OCR failed — defaulting to [0, 1] (inverted pixel)")
-    return (y_min, 1.0, y_max, 0.0)
+    return (y_min, 1.0, y_max, 0.0, "lin")

@@ -51,9 +51,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--method",
-        choices=["naive", "cv"],
+        choices=["naive", "cv", "trace"],
         default="naive",
-        help="Curve extraction method: 'naive' uses spline interpolation, 'cv' uses OpenCV",
+        help="Curve extraction: 'naive' = per-column spline, 'cv' = OpenCV "
+             "skeleton, 'trace' = arc-length curve following (handles steep "
+             "parts and crossings)",
     )
     parser.add_argument(
         "--x-range",

@@ -70,6 +70,16 @@ def extract_curves(
 
     curves: dict[str, np.ndarray] = {}
     for label, mask in color_masks.items():
+        if method == "trace":
+            # Arc-length tracing may split one mask into several curves
+            # (e.g. same-colour curves that cross) — emit each as its own label.
+            paths = _extract_trace(mask, x_min, y_min)
+            for k, pts in enumerate(paths):
+                lbl = label if len(paths) == 1 else f"{label}_seg{k:02d}"
+                curves[lbl] = pts
+                logger.info(f"  {lbl}: {len(pts)} points (trace)")
+            continue
+
         if method == "cv":
             pts = _extract_cv(mask, x_min, y_min)
         else:
@@ -121,12 +131,15 @@ def _segment_by_color(
     s = np.where(max_c > 1e-6, delta / safe_max, 0.0)
 
     # Detect and suppress grid pixels before any further analysis
-    grid_mask = _detect_grid(s, v, canvas.shape[:2], span_frac=span_frac) if has_grid else np.zeros(canvas.shape[:2], dtype=bool)
+    arrows: list[dict] = []
     if has_grid:
-        grid_px = int(grid_mask.sum())
-        logger.info(f"Grid pixels suppressed: {grid_px}")
+        grid_mask, arrows = _detect_grid(s, v, canvas.shape[:2], span_frac=span_frac)
+        logger.info(f"Grid pixels suppressed: {int(grid_mask.sum())}")
+    else:
+        grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:
         debug["grid_mask"] = grid_mask
+        debug["arrows"] = arrows
 
     if target_colors:
         return _segment_by_target_colors(
@@ -366,14 +379,10 @@ def _detect_grid(
     colour — essential for datasheet plots where grid and curve are both black.
 
     The key idea (thickness-aware removal): a grid line spans (almost) the full
-    axis but is *thin* (≤ grid_thick px), while the data curve is *thick*
-    (its line width, ~5–8 px) in every orientation — a steep near-vertical
-    curve is still that many pixels *wide*, a flat curve that many pixels
-    *tall*.  So within a full-span grid row we delete only the thin ink; the
-    thick curve crossing it is kept.  This stops the old behaviour of blanking
-    whole rows/columns and discarding clearly-visible data points where the
-    curve runs along or crosses a grid line (flat tail near the x-axis, the
-    x = max gridline, etc.).
+    axis but is *thin* (≤ grid_thick px), while the data curve is *thick* in
+    every orientation.  So within a flagged grid row we delete only the thin
+    ink; the thick curve crossing it is kept.  A line spanning nearly the whole
+    axis is removed whole (even if thick — log decade lines are drawn heavier).
 
     `grid_thick` is the maximum grid-line thickness in pixels.
     """
@@ -381,7 +390,6 @@ def _detect_grid(
 
     # Any achromatic mark, light *or* dark (grid, frame, curve all qualify).
     ink = (s < 0.30) & (v < 0.90)
-    # Vertical / horizontal run length per pixel = local line thickness.
     vrun = _run_length(ink, axis=0)
     hrun = _run_length(ink, axis=1)
     thin_v = vrun <= grid_thick
@@ -389,20 +397,18 @@ def _detect_grid(
 
     grid_mask = np.zeros((h, w), dtype=bool)
 
-    # --- Horizontal grid lines ------------------------------------------
-    # Rows whose ink spans ≥ full_span of the width. Delete only the thin ink
-    # in them, so a thick horizontal stretch of curve survives.
-    full_span = 0.85
-    row_grid = ink.sum(axis=1) > w * full_span
-    grid_mask |= row_grid[:, None] & ink & thin_v
+    # Full-span lines are grid regardless of thickness (a curve never fills a
+    # whole row/column).
+    solid_span = 0.92
+    grid_mask |= (ink.sum(axis=1) > w * solid_span)[:, None] & ink
+    grid_mask |= (ink.sum(axis=0) > h * solid_span)[None, :] & ink
 
-    # --- Vertical grid lines (+ y-axis spine) ---------------------------
-    col_grid = ink.sum(axis=0) > h * full_span
-    grid_mask |= col_grid[None, :] & ink & thin_h
+    # Partial-span lines: delete only the thin ink, keeping a thick curve.
+    full_span = 0.60
+    grid_mask |= (ink.sum(axis=1) > w * full_span)[:, None] & ink & thin_v
+    grid_mask |= (ink.sum(axis=0) > h * full_span)[None, :] & ink & thin_h
 
     # --- Thin border spines --------------------------------------------
-    # Remove only thin ink at the very edges (frame), never a thick curve that
-    # reaches the edge (e.g. the tail approaching x = max).
     edge = 4
     border = np.zeros((h, w), dtype=bool)
     border[:edge, :] = True
@@ -411,7 +417,115 @@ def _detect_grid(
     border[:, -edge:] = True
     grid_mask |= border & ink & (thin_v | thin_h)
 
-    return grid_mask
+    # --- Annotation arrows: suppress their shafts like grid lines -------
+    # Datasheet plots often carry label arrows (a thin horizontal shaft +
+    # a solid arrowhead) that cross the data curves.  The shaft is a strong
+    # horizontal distractor that derails the tracer.  Detect and suppress
+    # the shafts; the reclaim below then reconnects each curve across them.
+    arrows = _detect_arrows(ink & ~grid_mask, w, h)
+    for a in arrows:
+        grid_mask |= a["shaft_mask"]
+
+    # --- Reclaim curve pixels the grid removal punched out --------------
+    # Subtracting a grid line (or arrow shaft) leaves a small hole wherever
+    # the data curve crosses it; the tracer then wobbles across that gap.  A
+    # removed pixel that has *curve* ink on BOTH perpendicular sides is really
+    # the curve passing through — reclaim it so the tube stays solid at
+    # crossings.  (Pure grid/shaft pixels have curve ink on neither side.)
+    grid_mask &= ~_bridge_reclaim(ink & ~grid_mask, grid_mask, reach=5)
+
+    return grid_mask, arrows
+
+
+def _bridge_reclaim(curve: np.ndarray, grid_mask: np.ndarray, reach: int = 5) -> np.ndarray:
+    """
+    Return the subset of `grid_mask` pixels that bridge a curve gap.
+
+    A removed pixel is reclaimed when curve ink lies within `reach` px on both
+    sides along either the vertical or the horizontal axis — i.e. the curve
+    genuinely runs through it and the grid merely crossed on top.
+    """
+    above = np.zeros_like(curve)
+    below = np.zeros_like(curve)
+    left = np.zeros_like(curve)
+    right = np.zeros_like(curve)
+    for dk in range(1, reach + 1):
+        above[dk:, :] |= curve[:-dk, :]
+        below[:-dk, :] |= curve[dk:, :]
+        left[:, dk:] |= curve[:, :-dk]
+        right[:, :-dk] |= curve[:, dk:]
+    return grid_mask & ((above & below) | (left & right))
+
+
+def _detect_arrows(curve: np.ndarray, w: int, h: int) -> list[dict]:
+    """
+    Find annotation arrows (thin horizontal shaft + solid arrowhead) in the
+    curve ink after grid removal.
+
+    An arrow shaft is a long, dead-straight, thin *horizontal* line that is not
+    a grid line (grid is already gone).  It is told apart from a flat data-curve
+    tail by a **solid arrowhead** at one end: the arrowhead is a filled triangle,
+    so locally the ink is dense (a 2-D blob) whereas a line is sparse.
+
+    Returns a list of dicts: {shaft_mask, row, x_from, x_to, tip_x, tip_dir,
+    tail_x} in canvas pixel coords.  `tip_dir` is -1 if the head points left
+    (tip at x_from) else +1; `tail_x` is the label end.
+    """
+    from scipy import ndimage
+
+    hrun = _run_length(curve, axis=1)
+    vrun = _run_length(curve, axis=0)
+    min_len = max(60, int(0.08 * w))
+    bridge = max(40, int(0.10 * w))   # close gaps the crossing curves punch
+
+    # Dense ink = filled 2-D region (arrowhead), not a 1-2 px line.
+    fill = ndimage.uniform_filter(curve.astype(np.float32), size=7)
+    dense = curve & (fill >= 0.45)
+
+    # Locally-horizontal thin ink (shaft fragments); the vertical curves have a
+    # tiny horizontal run and are excluded.  Close along x to merge the shaft
+    # across the gaps where curves cross it, then label.
+    hseg = curve & (hrun >= 8) & (vrun <= 4)
+    se = np.ones((1, 2 * bridge + 1), dtype=bool)
+    hclosed = ndimage.binary_closing(hseg, structure=se)
+    lbl, n = ndimage.label(hclosed, structure=np.ones((3, 3), dtype=int))
+    arrows: list[dict] = []
+    for i in range(1, n + 1):
+        comp = lbl == i
+        ys, xs = np.where(comp)
+        x_from, x_to = int(xs.min()), int(xs.max())
+        y_lo, y_hi = int(ys.min()), int(ys.max())
+        if (x_to - x_from) < min_len or (y_hi - y_lo) > 6:
+            continue  # not a straight horizontal line
+        row = int(round(ys.mean()))
+        # Arrowhead: a dense (filled-triangle) blob within ~16 px of one end.
+        tip_dir, tip_x = 0, x_from
+        for xe, d in ((x_from, -1), (x_to, +1)):
+            xa = max(0, xe - 2) if d > 0 else max(0, xe - 16)
+            xb = min(w, xe + 17) if d > 0 else min(w, xe + 3)
+            if dense[max(0, row - 14):row + 15, xa:xb].sum() >= 6:
+                tip_dir, tip_x = d, xe
+                break
+        if tip_dir == 0:
+            continue  # a bare horizontal line with no head — leave it alone
+        # Suppress the shaft (thin horizontal ink over its span) plus the dense
+        # arrowhead blob near the tip.  The thin (non-dense) vertical curve that
+        # the shaft crosses or the head points at is left intact.
+        band = np.zeros_like(curve)
+        band[max(0, row - 4):row + 5, x_from:x_to + 1] = True
+        head = np.zeros_like(curve)
+        head[max(0, row - 14):row + 15,
+             max(0, tip_x - 18):min(w, tip_x + 19)] = True
+        shaft_mask = (hseg & band) | (dense & head)
+        arrows.append({
+            "shaft_mask": shaft_mask,
+            "row": row, "x_from": x_from, "x_to": x_to,
+            "tip_x": tip_x, "tip_dir": tip_dir,
+            "tail_x": x_to if tip_dir < 0 else x_from,
+        })
+    if arrows:
+        logger.info(f"Annotation arrows detected: {len(arrows)}")
+    return arrows
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +677,196 @@ def _reject_outliers(
             result[i] = np.median(ys[lo:hi])
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Trace extraction: arc-length curve following on the thick trace
+# ---------------------------------------------------------------------------
+
+def _extract_trace(
+    mask: np.ndarray,
+    x_offset: int,
+    y_offset: int,
+) -> list[np.ndarray]:
+    """
+    Follow each curve along its arc length (not column-by-column).
+
+    The plotted trace is a thick "tube" (many overlapping pen dots).  We ridge-
+    follow it: each step advances a fixed distance along the local heading, then
+    re-centres *perpendicular* to the heading using the median of the local
+    cross-section.  Decoupling forward motion from lateral centring keeps the
+    centre-line smooth (no side-to-side oscillation) and monotone along the
+    curve — data points are measurements, locally monotone, never doubling back.
+
+    Each connected component is traced from its **middle** outward to both ends
+    (cleaner end handling than starting at a tip).  A component containing a
+    crossing yields several centre-lines; each is returned separately, in image
+    pixel coordinates.
+    """
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+
+    if mask.sum() < 8:
+        return []
+
+    # Tube width from the distance transform → step size and search radius.
+    dist = ndimage.distance_transform_edt(mask)
+    width = max(2.0, 2.0 * float(np.median(dist[mask])))
+    step = max(2.0, 0.6 * width)
+    search_r = 1.6 * width + step        # large enough to bridge grid-crossing gaps
+    cover_r = max(2.0, 0.9 * width)
+
+    # One global point set: the mask is punched with small holes at every grid
+    # crossing, so we must let the march bridge gaps rather than rely on
+    # connected components (which would shatter one curve into many fragments).
+    coords = np.argwhere(mask)[:, ::-1].astype(float)  # (x, y)
+    tree = cKDTree(coords)
+    covered = np.zeros(len(coords), dtype=bool)
+
+    paths: list[np.ndarray] = []
+
+    while True:
+        remaining = np.where(~covered)[0]
+        if len(remaining) == 0:
+            break
+        # Seed at an extreme (left-most, then top-most) uncovered pixel — a real
+        # curve end.  We then march to the far end; ends fall out naturally.
+        seed_i = remaining[np.lexsort((coords[remaining, 1], coords[remaining, 0]))[0]]
+        seed = coords[seed_i].copy()
+
+        if len(tree.query_ball_point(seed, cover_r)) < 3:
+            covered[seed_i] = True
+            continue
+
+        # Start on the centre-line of the tip blob, not its raw edge pixel.
+        seed_center = coords[tree.query_ball_point(seed, cover_r)].mean(axis=0)
+
+        pre = covered.copy()
+        d0 = _local_direction(tree, coords, seed, search_r)
+        fwd = _march(tree, coords, covered, seed_center, d0, step, search_r,
+                     cover_r, width)
+        bwd = _march(tree, coords, covered, seed_center, -d0, step, search_r,
+                     cover_r, width)
+        covered[tree.query_ball_point(seed, cover_r)] = True
+
+        path = list(reversed(bwd)) + [seed_center] + fwd
+        if len(path) < 5:
+            continue
+
+        arr = np.array(path, dtype=float)
+        _, nn = tree.query(arr)
+        if pre[nn].mean() > 0.5:        # duplicate re-trace
+            continue
+
+        extent = np.hypot(*(arr.max(axis=0) - arr.min(axis=0)))
+        if extent < max(6.0 * width, 0.06 * max(mask.shape)):
+            continue
+
+        # Drop flat, near-horizontal streaks (leftover grid lines / label
+        # arrows): a data curve has real vertical extent.
+        span = arr.max(axis=0) - arr.min(axis=0)   # (dx, dy)
+        flat_thresh = max(8.0 * width, 0.035 * mask.shape[0])
+        if span[1] < flat_thresh and span[1] < 0.2 * span[0]:
+            logger.info(
+                f"  (dropped horizontal annotation/grid streak: "
+                f"dx={span[0]:.0f} dy={span[1]:.0f})"
+            )
+            continue
+
+        arr[:, 0] += x_offset
+        arr[:, 1] += y_offset
+        paths.append(arr)
+
+    paths.sort(key=len, reverse=True)
+    return paths
+
+
+def _local_direction(tree, coords, seed, radius) -> np.ndarray:
+    """Principal (PCA) direction of the mask pixels around `seed`."""
+    idxs = tree.query_ball_point(seed, radius)
+    if len(idxs) < 2:
+        return np.array([1.0, 0.0])
+    pts = coords[idxs] - coords[idxs].mean(axis=0)
+    _, _, vt = np.linalg.svd(pts, full_matrices=False)
+    d = vt[0]
+    n = np.linalg.norm(d)
+    return d / n if n > 1e-9 else np.array([1.0, 0.0])
+
+
+def _march(tree, coords, covered, start, direction, step, search_r, cover_r,
+           width, max_steps: int = 6000) -> list[np.ndarray]:
+    """
+    Walk from `start` along `direction`, one `step` at a time, returning the
+    ordered centre-line points (excluding the start point).
+
+    Each step: look in a forward cone (bridges the small holes the grid removal
+    punches), take the centroid of the forward pixels — this reliably finds the
+    way ahead and turns corners.  Then re-centre that point *perpendicular* to
+    the heading using the median of the local cross-section: this removes the
+    side-to-side oscillation the plain centroid showed on the beaded trace,
+    while forward progress keeps the centre-line monotone along the curve.
+    Continues over already-covered pixels (to pass crossings); stops when no
+    mask remains ahead.
+    """
+    STRAIGHT = np.cos(np.radians(45.0))   # window that defines "goes straight"
+    AHEAD = np.cos(np.radians(107.0))     # laxer cone so sharp bends still count
+    band = 1.5 * width
+
+    pts: list[np.ndarray] = []
+    p = start.astype(float).copy()
+    d = direction / (np.linalg.norm(direction) + 1e-12)
+
+    for _ in range(max_steps):
+        q = p + step * d
+        idxs = np.asarray(tree.query_ball_point(q, search_r), dtype=int)
+        if idxs.size == 0:
+            break
+
+        rel = coords[idxs] - p
+        norms = np.linalg.norm(rel, axis=1)
+        good = norms > 1e-6
+        idxs, rel, norms = idxs[good], rel[good], norms[good]
+        if idxs.size == 0:
+            break
+
+        cosang = rel.dot(d) / norms
+        ahead = cosang > AHEAD
+        if not ahead.any():
+            break
+        idxs_a = idxs[ahead]
+        cos_a = cosang[ahead]
+
+        # Prefer the straightest continuation (splits crossings); fall back to
+        # all forward pixels at a genuine sharp bend.
+        straight = cos_a > STRAIGHT
+        chosen = idxs_a[straight] if straight.any() else idxs_a
+
+        c = coords[chosen].mean(axis=0)
+
+        # Perpendicular re-centring: median lateral offset of the local
+        # cross-section around c → sit exactly on the tube centre (kills the
+        # lateral wobble of the raw centroid).
+        nrm = np.array([-d[1], d[0]])
+        relc = coords[idxs_a] - c
+        perp = relc.dot(nrm)
+        along = relc.dot(d)
+        cross = (np.abs(perp) < band) & (np.abs(along) < band)
+        if cross.sum() >= 3:
+            c = c + float(np.median(perp[cross])) * nrm
+
+        move = c - p
+        dist_moved = np.linalg.norm(move)
+        if dist_moved < 0.5:
+            break
+
+        newd = move / dist_moved
+        d = 0.6 * d + 0.4 * newd
+        d /= np.linalg.norm(d) + 1e-12
+        p = c
+        pts.append(p.copy())
+        covered[tree.query_ball_point(p, cover_r)] = True
+
+    return pts
 
 
 # ---------------------------------------------------------------------------
