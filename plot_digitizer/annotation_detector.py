@@ -157,6 +157,85 @@ def expand_to_white(
     return (x0, y0, x1, y1)
 
 
+def detect_grid_boxes(
+    canvas_rgb: np.ndarray,
+    span_frac: float = 0.55,
+    min_lines: int = 2,
+    pad: int = 2,
+) -> list[tuple[tuple[int, int, int, int], str]]:
+    """
+    Detect a white text box (e.g. the arrow-less note ``f=1.0MHz``) by the hole
+    it punches in the grid, then read it.
+
+    A label sits on a small patch of white paper that **interrupts the grid**:
+    where the box is, the horizontal *and* vertical grid lines simply stop.  We
+    already know where the grid lines are (rows/cols that span the axis), so we
+    look for lattice pixels that are genuine white paper (not dark ink, and
+    unsaturated so coloured curves crossing the grid don't count).  Those
+    interrupted-lattice pixels cluster into the box; OCR then confirms it carries
+    text (plot whitespace reads empty and is dropped).
+
+    Returns a list of ``((x0, y0, x1, y1), text)`` in canvas pixel coords.
+    """
+    from scipy import ndimage
+
+    r = canvas_rgb[:, :, 0] / 255.0
+    g = canvas_rgb[:, :, 1] / 255.0
+    b = canvas_rgb[:, :, 2] / 255.0
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    v = max_c
+    s = np.where(max_c > 1e-6, (max_c - min_c) / np.where(max_c > 1e-6, max_c, 1.0), 0.0)
+    ink = (s < 0.30) & (v < 0.90)
+    h, w = ink.shape
+
+    H = np.where(ink.sum(axis=1) > span_frac * w)[0]
+    V = np.where(ink.sum(axis=0) > span_frac * h)[0]
+    if len(H) < min_lines + 1 or len(V) < min_lines + 1:
+        return []
+
+    def _spacing(idx):
+        if len(idx) < 2:
+            return 20
+        d = np.diff(np.sort(idx)); d = d[d > 3]
+        return int(np.median(d)) if len(d) else 20
+    sp = max(_spacing(H), _spacing(V))
+
+    lat = np.zeros((h, w), bool)
+    lat[H, :] = True
+    lat[:, V] = True
+    # Interrupted grid pixel: on the lattice, but white paper instead of a line
+    # (not dark ink, and unsaturated — a coloured curve crossing is ~ink too but
+    # highly saturated, so it is excluded).
+    interrupted = lat & ~ink & (s < 0.20)
+
+    it = max(3, sp // 2 + 2)
+    dil = ndimage.binary_dilation(interrupted, iterations=it)
+    lbl, n = ndimage.label(dil)
+
+    results: list[tuple[tuple[int, int, int, int], str]] = []
+    for i in range(1, n + 1):
+        ys, xs = np.where(lbl == i)
+        bx0, bx1, by0, by1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+        inside = interrupted[by0:by1 + 1, bx0:bx1 + 1]
+        rows_hit = sum(1 for rr in H if by0 <= rr <= by1 and inside[rr - by0].sum() > 3)
+        cols_hit = sum(1 for cc in V if bx0 <= cc <= bx1 and inside[:, cc - bx0].sum() > 3)
+        if rows_hit < min_lines or cols_hit < min_lines:
+            continue
+        # tighten to the actual interrupted pixels, then read the crop
+        iy, ix = np.where(inside)
+        tx0, tx1 = bx0 + int(ix.min()), bx0 + int(ix.max())
+        ty0, ty1 = by0 + int(iy.min()), by0 + int(iy.max())
+        box = (max(0, tx0 - pad), max(0, ty0 - pad),
+               min(w, tx1 + pad + 1), min(h, ty1 + pad + 1))
+        text = ocr_boxes(canvas_rgb, [box], whitelist="")[0]
+        # Keep only boxes OCR confirms carry text (>=2 non-space chars); plot
+        # whitespace reads empty and is discarded.
+        if len(text.replace(" ", "")) >= 2:
+            results.append((box, text))
+    return results
+
+
 def ocr_boxes(
     canvas_rgb: np.ndarray,
     boxes: list[tuple[int, int, int, int]],

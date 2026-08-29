@@ -141,7 +141,7 @@ def _segment_by_color(
     if debug is not None:
         from .annotation_detector import (
             detect_text_boxes, detect_legend_boxes, snap_labels_to_legend,
-            expand_to_white, ocr_boxes,
+            expand_to_white, ocr_boxes, detect_grid_boxes,
         )
         _ink = (s < 0.30) & (v < 0.90)
         debug["grid_mask"] = grid_mask
@@ -151,9 +151,15 @@ def _segment_by_color(
         # Grow each legend to the true white-box edges (where the grid resumes).
         legends = [expand_to_white(_ink, lg) for lg in legends]
         tboxes = snap_labels_to_legend(tboxes, legends)
+        label_texts = ocr_boxes(canvas, tboxes)
+        # Arrow-less notes on a white patch (e.g. "f=1.0MHz") are found by the
+        # hole they punch in the grid, and come with their OCR reading already.
+        for gbox, gtext in detect_grid_boxes(canvas, span_frac=span_frac):
+            tboxes.append(gbox)
+            label_texts.append(gtext)
         debug["text_boxes"] = tboxes
         debug["legend_boxes"] = legends
-        debug["label_texts"] = ocr_boxes(canvas, tboxes)
+        debug["label_texts"] = label_texts
 
     if target_colors:
         return _segment_by_target_colors(
