@@ -325,68 +325,91 @@ def _segment_achromatic(
     return masks
 
 
+def _run_length(mask: np.ndarray, axis: int) -> np.ndarray:
+    """
+    For every True pixel, return the length of the contiguous True run it
+    belongs to along `axis` (0 = vertical, 1 = horizontal); 0 elsewhere.
+
+    This measures local line *thickness*: a 1–2 px grid line has a small run
+    perpendicular to itself, while a thick data curve has a large one.
+    """
+    if axis == 1:
+        return _run_length(mask.T, axis=0).T
+
+    m = mask.astype(np.int32)
+    n = m.shape[0]
+    # end[i] = length of the run ending at row i (0 if not ink)
+    end = np.zeros_like(m)
+    end[0] = m[0]
+    for i in range(1, n):
+        end[i] = (end[i - 1] + 1) * m[i]
+    # Propagate the full run length back up to every pixel in the run.
+    length = np.zeros_like(m)
+    length[n - 1] = end[n - 1]
+    for i in range(n - 2, -1, -1):
+        cont = mask[i] & mask[i + 1]
+        length[i] = np.where(mask[i], np.where(cont, length[i + 1], end[i]), 0)
+    return length
+
+
 def _detect_grid(
     s: np.ndarray,
     v: np.ndarray,
     shape: tuple[int, int],
     span_frac: float = 0.55,
+    grid_thick: int = 3,
 ) -> np.ndarray:
     """
     Identify grid / spine pixels to suppress before curve extraction.
 
     Grid lines are separated from the data curve **geometrically**, not by
-    colour — this is essential for datasheet plots where the grid and the
-    curve are both black (colour segmentation alone cannot tell them apart).
+    colour — essential for datasheet plots where grid and curve are both black.
 
-    Pass 1 — light periodic grid lines (pale grey mesh):
-        Achromatic *light* rows/columns spanning ≥ span_frac of the canvas.
+    The key idea (thickness-aware removal): a grid line spans (almost) the full
+    axis but is *thin* (≤ grid_thick px), while the data curve is *thick*
+    (its line width, ~5–8 px) in every orientation — a steep near-vertical
+    curve is still that many pixels *wide*, a flat curve that many pixels
+    *tall*.  So within a full-span grid row we delete only the thin ink; the
+    thick curve crossing it is kept.  This stops the old behaviour of blanking
+    whole rows/columns and discarding clearly-visible data points where the
+    curve runs along or crosses a grid line (flat tail near the x-axis, the
+    x = max gridline, etc.).
 
-    Pass 2 — dark / black grid lines (and the plot frame):
-        A true grid line is thin yet spans (almost) the entire width (a
-        horizontal line) or height (a vertical line).  A data curve is a
-        function: it is thick but never fills a whole row/column.  So we
-        flag any achromatic *ink* row/column whose coverage is ≥ full_span
-        (a deliberately high threshold, ~0.9) as a grid line.  The curve
-        survives because even its flat tail covers well under 90 % of the
-        width in any single row.  Curve pixels sitting on a grid crossing
-        are lost as small gaps, which the spline fit bridges cleanly.
-
-    Pass 3 — canvas border / tick-mark area:
-        * Top & sides : small fixed margin (spine line width).
-        * Bottom      : larger margin (h // 10) to cover x-axis tick marks
-          and their anti-aliasing bleed, which can look like gray curves.
+    `grid_thick` is the maximum grid-line thickness in pixels.
     """
     h, w = shape
 
+    # Any achromatic mark, light *or* dark (grid, frame, curve all qualify).
+    ink = (s < 0.30) & (v < 0.90)
+    # Vertical / horizontal run length per pixel = local line thickness.
+    vrun = _run_length(ink, axis=0)
+    hrun = _run_length(ink, axis=1)
+    thin_v = vrun <= grid_thick
+    thin_h = hrun <= grid_thick
+
     grid_mask = np.zeros((h, w), dtype=bool)
 
-    # --- Pass 1: light grey grid mesh -----------------------------------
-    light = (s < 0.12) & (v > 0.60) & (v < 0.97)
-    grid_mask[light.sum(axis=1) > w * span_frac, :] = True
-    grid_mask[:, light.sum(axis=0) > h * span_frac] = True
+    # --- Horizontal grid lines ------------------------------------------
+    # Rows whose ink spans ≥ full_span of the width. Delete only the thin ink
+    # in them, so a thick horizontal stretch of curve survives.
+    full_span = 0.85
+    row_grid = ink.sum(axis=1) > w * full_span
+    grid_mask |= row_grid[:, None] & ink & thin_v
 
-    # --- Pass 2: dark / black grid lines + frame ------------------------
-    # Any achromatic ink pixel (grid, curve, frame all qualify here).
-    ink = (s < 0.30) & (v < 0.45)
-    # Full-span threshold: a grid line spans nearly the whole axis; a curve
-    # never does.  Kept high so the curve's flat tail is not mistaken for a
-    # horizontal grid line.
-    full_span = 0.90
-    grid_mask[ink.sum(axis=1) > w * full_span, :] = True
-    grid_mask[:, ink.sum(axis=0) > h * full_span] = True
+    # --- Vertical grid lines (+ y-axis spine) ---------------------------
+    col_grid = ink.sum(axis=0) > h * full_span
+    grid_mask |= col_grid[None, :] & ink & thin_h
 
-    # --- Pass 3: fixed border ------------------------------------------
-    # Just the spine line width on every side.  The x-axis line and its tick
-    # bleed are already removed by the full-span passes above, so a big bottom
-    # margin is no longer needed (it used to blank the whole lower tenth).
-    top = 5
-    side = 5
-    bottom = 5
-
-    grid_mask[:top, :] = True
-    grid_mask[-bottom:, :] = True
-    grid_mask[:, :side] = True
-    grid_mask[:, -side:] = True
+    # --- Thin border spines --------------------------------------------
+    # Remove only thin ink at the very edges (frame), never a thick curve that
+    # reaches the edge (e.g. the tail approaching x = max).
+    edge = 4
+    border = np.zeros((h, w), dtype=bool)
+    border[:edge, :] = True
+    border[-edge:, :] = True
+    border[:, :edge] = True
+    border[:, -edge:] = True
+    grid_mask |= border & ink & (thin_v | thin_h)
 
     return grid_mask
 
