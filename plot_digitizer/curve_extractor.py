@@ -1,6 +1,7 @@
 """Extract curves from the plot canvas by color."""
 
 import logging
+import math
 from typing import Optional
 import numpy as np
 from scipy import interpolate
@@ -666,17 +667,23 @@ def _extract_trace(
 
         pre = covered.copy()
         d0 = _local_direction(tree, coords, seed, search_r)
-        fwd = _march(tree, coords, covered, seed_center, d0, step, search_r,
+        fwd = _march(tree, coords, seed_center, d0, step, search_r,
                      cover_r, width)
-        bwd = _march(tree, coords, covered, seed_center, -d0, step, search_r,
+        bwd = _march(tree, coords, seed_center, -d0, step, search_r,
                      cover_r, width)
         covered[tree.query_ball_point(seed, cover_r)] = True
 
         path = list(reversed(bwd)) + [seed_center] + fwd
+        arr = np.array(path, dtype=float)
+        # Cover this marched footprint in one batched KD-tree query — replaces
+        # the per-step query that used to run inside _march (half the tracer's
+        # tree lookups).  Done for every path, kept or dropped, so a dropped
+        # streak or short stub is not re-seeded.
+        for grp in tree.query_ball_point(arr, cover_r):
+            covered[grp] = True
         if len(path) < 5:
             continue
 
-        arr = np.array(path, dtype=float)
         _, nn = tree.query(arr)
         if pre[nn].mean() > 0.5:        # duplicate re-trace
             continue
@@ -690,6 +697,11 @@ def _extract_trace(
         span = arr.max(axis=0) - arr.min(axis=0)   # (dx, dy)
         flat_thresh = max(8.0 * width, 0.035 * mask.shape[0])
         if span[1] < flat_thresh and span[1] < 0.2 * span[0]:
+            # Mark the whole streak covered so its off-centre rows aren't
+            # re-seeded and marched a second time (the doubled log lines) — a
+            # confirmed non-curve, so covering its pixels is safe.
+            for grp in tree.query_ball_point(arr, 1.5 * width):
+                covered[grp] = True
             logger.info(
                 f"  (dropped horizontal annotation/grid streak: "
                 f"dx={span[0]:.0f} dy={span[1]:.0f})"
@@ -817,7 +829,7 @@ def _local_direction(tree, coords, seed, radius) -> np.ndarray:
     return d / n if n > 1e-9 else np.array([1.0, 0.0])
 
 
-def _march(tree, coords, covered, start, direction, step, search_r, cover_r,
+def _march(tree, coords, start, direction, step, search_r, cover_r,
            width, max_steps: int = 6000) -> list[np.ndarray]:
     """
     Walk from `start` along `direction`, one `step` at a time, returning the
@@ -834,11 +846,17 @@ def _march(tree, coords, covered, start, direction, step, search_r, cover_r,
     """
     STRAIGHT = np.cos(np.radians(45.0))   # window that defines "goes straight"
     AHEAD = np.cos(np.radians(107.0))     # laxer cone so sharp bends still count
-    band = 1.5 * width
 
     pts: list[np.ndarray] = []
     p = start.astype(float).copy()
-    d = direction / (np.linalg.norm(direction) + 1e-12)
+    d = direction / (math.hypot(direction[0], direction[1]) + 1e-12)
+
+    # Coil guard: a curve's travelled length stays close to its bounding-box
+    # extent (ratio ≈ 1); a compact text/annotation blob makes the march spiral,
+    # so its length balloons far past its extent.  Bail once that happens instead
+    # of grinding to max_steps — this is what made the flat "streak" drops slow.
+    x0 = x1 = float(p[0])
+    y0 = y1 = float(p[1])
 
     for _ in range(max_steps):
         q = p + step * d
@@ -847,7 +865,10 @@ def _march(tree, coords, covered, start, direction, step, search_r, cover_r,
             break
 
         rel = coords[idxs] - p
-        norms = np.linalg.norm(rel, axis=1)
+        # ‖rel‖ per row — sqrt(sum of squares) is the same value as
+        # np.linalg.norm(axis=1) but skips its generic dispatch, which is the
+        # tracer's single hottest line.
+        norms = np.sqrt(np.einsum("ij,ij->i", rel, rel))
         good = norms > 1e-6
         idxs, rel, norms = idxs[good], rel[good], norms[good]
         if idxs.size == 0:
@@ -865,30 +886,37 @@ def _march(tree, coords, covered, start, direction, step, search_r, cover_r,
         straight = cos_a > STRAIGHT
         chosen = idxs_a[straight] if straight.any() else idxs_a
 
-        c = coords[chosen].mean(axis=0)
+        pts_chosen = coords[chosen]
+        c = pts_chosen.sum(axis=0) / len(pts_chosen)   # == mean(axis=0), cheaper
 
-        # Perpendicular re-centring: median lateral offset of the local
-        # cross-section around c → sit exactly on the tube centre (kills the
-        # lateral wobble of the raw centroid).
-        nrm = np.array([-d[1], d[0]])
-        relc = coords[idxs_a] - c
-        perp = relc.dot(nrm)
-        along = relc.dot(d)
-        cross = (np.abs(perp) < band) & (np.abs(along) < band)
-        if cross.sum() >= 3:
-            c = c + float(np.median(perp[cross])) * nrm
+        # (Perpendicular median re-centring removed.)  With the grid subtracted
+        # as an exact object the tube is clean, so the forward-cone centroid
+        # already sits on the centre-line; the residual wobble that the median
+        # used to damp is smoothed by _clean_path (rolling median + Savitzky-
+        # Golay).  Dropping it removes the tracer's per-step median plus two
+        # dot products — the remaining hot spot after the earlier pass.
 
         move = c - p
-        dist_moved = np.linalg.norm(move)
+        dist_moved = math.hypot(move[0], move[1])
         if dist_moved < 0.5:
             break
 
         newd = move / dist_moved
         d = 0.6 * d + 0.4 * newd
-        d /= np.linalg.norm(d) + 1e-12
+        d /= math.hypot(d[0], d[1]) + 1e-12
         p = c
         pts.append(p.copy())
-        covered[tree.query_ball_point(p, cover_r)] = True
+
+        px, py = float(p[0]), float(p[1])
+        if px < x0: x0 = px
+        elif px > x1: x1 = px
+        if py < y0: y0 = py
+        elif py > y1: y1 = py
+        n = len(pts)
+        if (n & 63) == 0:
+            extent = math.hypot(x1 - x0, y1 - y0)
+            if n * step > 3.0 * extent + 4.0 * width:   # spiralling in a blob
+                break
 
     return pts
 
