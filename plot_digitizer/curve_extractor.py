@@ -762,6 +762,19 @@ def _extract_trace(
             )
             continue
 
+        # Drop short, shallow fragments — arrow leaders (label→curve) that the
+        # U-turn guard no longer sweeps up inside a doubled trace.  A real data
+        # curve is either long (spans the plot) or steep (vertical); an arrow
+        # leader is short AND flatter than 45°, so it is neither.
+        if extent < 0.15 * max(mask.shape) and span[1] < span[0]:
+            for grp in tree.query_ball_point(arr, 1.5 * width):
+                covered[grp] = True
+            logger.info(
+                f"  (dropped short arrow-leader fragment: "
+                f"dx={span[0]:.0f} dy={span[1]:.0f})"
+            )
+            continue
+
         arr[:, 0] += x_offset
         arr[:, 1] += y_offset
         arr = _clean_path(arr, width)
@@ -904,6 +917,7 @@ def _march(tree, coords, start, direction, step, search_r, cover_r,
     pts: list[np.ndarray] = []
     p = start.astype(float).copy()
     d = direction / (math.hypot(direction[0], direction[1]) + 1e-12)
+    d_init = d.copy()      # a data curve is monotone — it never reverses past this
 
     # Coil guard: a curve's travelled length stays close to its bounding-box
     # extent (ratio ≈ 1); a compact text/annotation blob makes the march spiral,
@@ -956,6 +970,13 @@ def _march(tree, coords, start, direction, step, search_r, cover_r,
             break
 
         newd = move / dist_moved
+        # U-turn guard: at a curve END the wide cone grabs the stroke-width pixels
+        # and swings the march 180° back UP the tube, double-tracing it (the little
+        # triangles seen at the bottom of the steep CMZ curves).  A real data curve
+        # is monotone and never reverses past its start heading, so a step that
+        # points opposite d_init is that fold — stop instead of doubling back.
+        if newd[0] * d_init[0] + newd[1] * d_init[1] < -0.3:
+            break
         d = 0.6 * d + 0.4 * newd
         d /= math.hypot(d[0], d[1]) + 1e-12
         p = c
