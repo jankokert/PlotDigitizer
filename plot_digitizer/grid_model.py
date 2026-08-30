@@ -135,12 +135,12 @@ def _fit_log(pos: np.ndarray, tol: float = 0.025) -> Optional[dict]:
         best["anchor"] = float(intercept)
     else:
         best["anchor"] = float(p0 - W * phi)           # center = anchor + W·t
-    # Tag each line major/minor: a decade line (×10^k) sits at fraction 0/1; the
-    # minor lines 2..9 sit further in.  Lets each class carry its own width.
-    dec = np.minimum(frac, 1.0 - frac)
-    minor_off = mant[1:]                               # the 8 non-decade offsets
-    minor = np.min(np.abs(frac[:, None] - minor_off[None, :]), axis=1)
-    best["major"] = best["inl"] & (dec <= minor)
+    # Tag each line major/minor from the SAME refined lattice the enumeration uses
+    # (anchor + W·t): a decade (×10^k) sits at an integer lattice coord t, minor
+    # lines 2..9 sit ≥0.046 away.  Using the coarse phase here instead would
+    # mis-tag the endpoints (e.g. the top frame line 10000) as minor → drawn 1 px.
+    tt = (pos - best["anchor"]) / best["W"]
+    best["major"] = best["inl"] & (np.abs(tt - np.round(tt)) < 0.025)
     return best
 
 
