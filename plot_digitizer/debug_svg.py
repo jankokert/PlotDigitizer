@@ -76,18 +76,25 @@ def write_grid_debug_png(
             red = np.array([230.0, 0.0, 0.0])
             px = base[ys + y_min, xs + x_min].astype(np.float32)
             base[ys + y_min, xs + x_min] = (px * (1 - a) + red * a).astype(np.uint8)
+        # Grid over white = an interruption (empty region, white legend/label box).
+        # Blend it FAINT so it reads as "the line would be here" without chopping
+        # each partly-inked log line into a jarring red/green stripe — the solid
+        # red on-ink lines then clearly show the true log distribution.
         ys, xs = np.where(anomaly)
-        base[ys + y_min, xs + x_min] = (0, 200, 0)
+        if len(xs):
+            g = np.array([0.0, 200.0, 0.0]); af = 0.45
+            px = base[ys + y_min, xs + x_min].astype(np.float32)
+            base[ys + y_min, xs + x_min] = (px * (1 - af) + g * af).astype(np.uint8)
     if arrow_mask is not None:
         ys, xs = np.where(arrow_mask)
         base[ys + y_min, xs + x_min] = (0, 90, 230)
     if arrow_gray is not None:
-        # Blend the model coverage over the base as translucent orange so the
+        # Blend the model coverage over the base as translucent BLUE so the
         # anti-aliased sector shape (and how well it hugs the ink) is visible.
         ys, xs = np.where(arrow_gray > 0.02)
         if len(xs):
             a = arrow_gray[ys, xs][:, None]
-            col = np.array([255.0, 140.0, 0.0])
+            col = np.array([20.0, 110.0, 255.0])
             px = base[ys + y_min, xs + x_min].astype(np.float32)
             base[ys + y_min, xs + x_min] = (px * (1 - a) + col * a).astype(np.uint8)
     Image.fromarray(base).save(out_path)

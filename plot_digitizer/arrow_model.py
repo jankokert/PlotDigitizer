@@ -59,11 +59,13 @@ class ArrowModel:
     head_len: float
     half_angle_deg: float
     shaft_width: float
+    base_width: float = 0.0            # triangle base (hypotenuse) width, px
 
     def to_dict(self) -> dict:
         return {"head_len": self.head_len,
                 "half_angle_deg": self.half_angle_deg,
                 "shaft_width": self.shaft_width,
+                "base_width": self.base_width,
                 "arrows": [asdict(a) for a in self.arrows]}
 
 
@@ -106,6 +108,17 @@ def _sample(mask: np.ndarray, p) -> bool:
     return 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and bool(mask[yi, xi])
 
 
+def _perp_halfwidth(fg: np.ndarray, c: np.ndarray, n: np.ndarray, lim: int = 14) -> float:
+    """Measured ink half-width of ``fg`` at point ``c`` along the unit normal ``n``."""
+    p = 0
+    while p < lim and _sample(fg, c + n * (p + 1)):
+        p += 1
+    q = 0
+    while q < lim and _sample(fg, c - n * (q + 1)):
+        q += 1
+    return 0.5 * (p + q + 1)
+
+
 def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional[dict]:
     """Fit the head triangle for one confirmed callout (its head_box + tip)."""
     h, w = fg.shape
@@ -138,13 +151,19 @@ def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional
     if not (_HALF_ANGLE_RANGE[0] <= half_angle <= _HALF_ANGLE_RANGE[1]):
         return None
     u = axis / L                                   # base→apex unit
-    # make the shaft point from base to the tail (away from the apex)
-    v_tail = tail - base_mid
-    if v_tail @ (-u) < 0:                           # tail should be on the -u side
-        pass
     theta = math.degrees(math.atan2(axis[1], axis[0]))
-    # shaft width: perpendicular ink thickness just behind the base
     n = np.array([-u[1], u[0]])
+    # Measure the true base half-width from the ink: the hull's farthest-pair base
+    # underestimates a filled head (thick-pixel floor clips the flanks), and the
+    # visible black head is markedly wider than any line.  Take the widest ink
+    # section across the rear half of the head.
+    base_half = max(
+        _perp_halfwidth(fg, base_mid, n),
+        _perp_halfwidth(fg, apex - u * (0.8 * L), n),
+        _perp_halfwidth(fg, apex - u * (0.6 * L), n),
+        base_len / 2.0,
+    )
+    # shaft width: perpendicular ink thickness just behind the base
     back = base_mid - u * 2.0
     wpos = 0
     while wpos < 8 and _sample(fg, back + n * (wpos + 1)):
@@ -156,6 +175,7 @@ def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional
     shaft_len = float(math.hypot(*(tail - base_mid)))
     return {"apex": apex, "base_mid": base_mid, "u": u, "theta": theta,
             "L": L, "half_angle": half_angle, "shaft_w": shaft_w,
+            "base_half": float(base_half),
             "shaft_len": shaft_len, "tail": tail, "label": anchor.get("label")}
 
 
@@ -272,24 +292,33 @@ def model_arrows(
         return arrow_gray, arrow_mask, ArrowModel([], 0.0, 0.0, 0.0)
 
     # One head style for the whole chart (median = robust to a noisy single fit).
+    # The base half-width is MEASURED from the ink (the visible black head is much
+    # wider than the hull's clipped estimate), so the drawn head matches its size.
     L_star = float(np.median([f["L"] for f in fits]))
-    a_star = float(np.median([f["half_angle"] for f in fits]))
     w_star = float(np.median([f["shaft_w"] for f in fits]))
-    base_half = L_star * math.tan(math.radians(a_star))
+    base_half_star = float(np.median([f["base_half"] for f in fits]))
+    a_star = math.degrees(math.atan2(base_half_star, L_star))
 
     darkness = 1.0 - v
     arrows: list[Arrow] = []
     for f in fits:
-        base_mid = f["base_mid"]
-        u = f["u"]
-        nrm = np.array([-u[1], u[0]])
-        apex = base_mid + u * L_star
-        cA = base_mid + nrm * base_half
-        cB = base_mid - nrm * base_half
+        # Straight axis from the two RELIABLE points — the tip (on the curve) and
+        # the tail (at the label) — so the shaft runs straight out of the head with
+        # no kink (the tiny triangle fit gives a noisy direction; this long
+        # baseline does not).  Head and shaft share this single axis.
+        apex = f["apex"]
         tail = f["tail"]
-        shaft_len = f["shaft_len"]
+        axis = apex - tail
+        La = math.hypot(axis[0], axis[1])
+        u = axis / La if La > 1e-6 else f["u"]        # tail→apex unit
+        nrm = np.array([-u[1], u[0]])
+        base_mid = apex - u * L_star                  # base sits L_star behind the tip, on-axis
+        cA = base_mid + nrm * base_half_star
+        cB = base_mid - nrm * base_half_star
+        shaft_len = float(max(0.0, float((tail - base_mid) @ (-u))))
+        shaft_tail = base_mid - u * shaft_len         # colinear tail → straight shaft
 
-        info = _raster_into(arrow_gray, apex, cA, cB, base_mid, tail, w_star)
+        info = _raster_into(arrow_gray, apex, cA, cB, base_mid, shaft_tail, w_star)
         if info is not None:
             bx0, by0, bx1, by1, tri_cov = info
             arrow_mask[by0:by1, bx0:bx1] |= ink[by0:by1, bx0:bx1] & (tri_cov >= 0.5)
@@ -298,9 +327,10 @@ def model_arrows(
         arrows.append(Arrow(
             apex=(float(apex[0]), float(apex[1])),
             base_mid=(float(base_mid[0]), float(base_mid[1])),
-            tail=(float(tail[0]), float(tail[1])),
-            theta_deg=f["theta"], head_len=L_star, half_angle_deg=a_star,
-            shaft_len=float(shaft_len), label=f["label"]))
+            tail=(float(shaft_tail[0]), float(shaft_tail[1])),
+            theta_deg=math.degrees(math.atan2(u[1], u[0])),
+            head_len=L_star, half_angle_deg=a_star,
+            shaft_len=shaft_len, label=f["label"]))
 
     # Protect genuine curve crossings: where the model is thin yet the ink is
     # much darker than predicted, a curve crosses — keep it.
@@ -308,4 +338,5 @@ def model_arrows(
     arrow_mask &= ~keep
 
     return arrow_gray, arrow_mask, ArrowModel(
-        arrows=arrows, head_len=L_star, half_angle_deg=a_star, shaft_width=w_star)
+        arrows=arrows, head_len=L_star, half_angle_deg=a_star, shaft_width=w_star,
+        base_width=2.0 * base_half_star)

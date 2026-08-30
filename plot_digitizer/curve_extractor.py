@@ -102,6 +102,29 @@ def extract_curves(
 # Color segmentation
 # ---------------------------------------------------------------------------
 
+def _measure_stroke_width(mask: np.ndarray) -> Optional[float]:
+    """Median stroke width (px) of a thin-line mask = 2× the ridge distance.
+
+    A stroke of width w has distance-transform ≈ w/2 along its centre ridge; the
+    median over ridge pixels is robust to junctions and the arrowheads (a minority
+    of much wider points).
+    """
+    if int(mask.sum()) < 20:
+        return None
+    from scipy import ndimage
+    from scipy.ndimage import maximum_filter
+    dist = ndimage.distance_transform_edt(mask)
+    ridge = mask & (dist >= maximum_filter(dist, size=3) - 1e-6) & (dist > 0)
+    vals = dist[ridge]
+    if vals.size == 0:
+        return None
+    return float(2.0 * np.median(vals))
+
+
+def _fmt_w(x: Optional[float]) -> str:
+    return "?" if x is None else f"{x:.1f}"
+
+
 def _segment_by_color(
     canvas: np.ndarray,
     sat_threshold: float = 0.20,
@@ -175,9 +198,24 @@ def _segment_by_color(
                 f"Arrows: {len(arrow_obj.arrows)} (head L={arrow_obj.head_len:.1f}px "
                 f"2α={2 * arrow_obj.half_angle_deg:.0f}° shaft w={arrow_obj.shaft_width:.1f}px)"
             )
+        # Width hierarchy (minor-grid < major-grid < plot-line < arrow-base): a
+        # discriminator for the arrowheads and a physical sanity check.  The plot
+        # (curve) stroke width is measured from the ink left after grid+arrow
+        # removal.  Reported in the log and JSON.
+        plot_w = _measure_stroke_width(_ink0 & ~grid_mask)
+        widths = {"minor_grid": grid_obj.minor_width,
+                  "major_grid": grid_obj.major_width,
+                  "plot_line": plot_w,
+                  "arrow_base": (arrow_obj.base_width or None)}
+        logger.info(
+            "Widths(px): minor-grid=%s < major-grid=%s < plot-line=%s < arrow-base=%s"
+            % (_fmt_w(grid_obj.minor_width), _fmt_w(grid_obj.major_width),
+               _fmt_w(plot_w), _fmt_w(arrow_obj.base_width or None))
+        )
         if debug is not None:
             debug["arrow_gray"] = arrow_gray
             debug["arrow_model"] = arrow_obj.to_dict()
+            debug["widths"] = widths
     else:
         grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:

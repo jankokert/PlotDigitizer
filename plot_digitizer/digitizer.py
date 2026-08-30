@@ -114,6 +114,9 @@ def digitize_plot(
         arrow_model = (debug or {}).get("arrow_model")
         if arrow_model is not None:
             import json
+            widths = (debug or {}).get("widths")
+            if widths is not None:
+                arrow_model = {**arrow_model, "widths_px": widths}
             apath = debug_svg.with_name(debug_svg.stem + "_arrows.json")
             apath.write_text(json.dumps(arrow_model, indent=2), encoding="utf-8")
             logger.info(f"Arrow model JSON written to: {apath}")
