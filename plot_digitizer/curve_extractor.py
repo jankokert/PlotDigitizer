@@ -156,12 +156,28 @@ def _segment_by_color(
         # than the grid and derail the tracer where they cross a curve); the
         # removal is crossing-protected so no gap is punched.  (OCR ~4 s.)
         from .annotation_detector import detect_text_labels_ocr, detect_arrows
+        from .arrow_model import model_arrows
         _ink0 = (s < 0.30) & (v < 0.90)
         _ocr_labels = detect_text_labels_ocr(canvas)
         label_arrows = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        # Parametric arrow model (triangular head + shaft) reconstructed on the
+        # pixels, anchored on the confirmed callout heads, and subtracted with an
+        # anti-aliased footprint; union with the horizontal on-grid shaft removal
+        # so we never remove less than before.
+        arrow_gray, arrow_model_mask, arrow_obj = model_arrows(
+            s, v, grid_mask, label_arrows)
+        arrow_mask = arrow_model_mask
         if label_arrows:
-            arrow_mask = _arrow_removal_mask(label_arrows, _ink0)
-            grid_mask |= arrow_mask
+            arrow_mask = arrow_mask | _arrow_removal_mask(label_arrows, _ink0)
+        grid_mask |= arrow_mask
+        if arrow_obj.arrows:
+            logger.info(
+                f"Arrows: {len(arrow_obj.arrows)} (head L={arrow_obj.head_len:.1f}px "
+                f"2α={2 * arrow_obj.half_angle_deg:.0f}° shaft w={arrow_obj.shaft_width:.1f}px)"
+            )
+        if debug is not None:
+            debug["arrow_gray"] = arrow_gray
+            debug["arrow_model"] = arrow_obj.to_dict()
     else:
         grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:

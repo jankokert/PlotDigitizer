@@ -103,6 +103,7 @@ def digitize_plot(
             grid_gray=(debug or {}).get("grid_gray"),
             ink=(debug or {}).get("ink"),
             arrow_mask=(debug or {}).get("arrow_mask"),
+            arrow_gray=(debug or {}).get("arrow_gray"),
         )
         grid_model = (debug or {}).get("grid_model")
         if grid_model is not None:
@@ -110,6 +111,12 @@ def digitize_plot(
             json_path = debug_svg.with_name(debug_svg.stem + "_grid.json")
             json_path.write_text(json.dumps(grid_model, indent=2), encoding="utf-8")
             logger.info(f"Grid model JSON written to: {json_path}")
+        arrow_model = (debug or {}).get("arrow_model")
+        if arrow_model is not None:
+            import json
+            apath = debug_svg.with_name(debug_svg.stem + "_arrows.json")
+            apath.write_text(json.dumps(arrow_model, indent=2), encoding="utf-8")
+            logger.info(f"Arrow model JSON written to: {apath}")
 
     # 5. Convert pixel → data coordinates and collect rows
     rows: list[tuple[str, float, float]] = []

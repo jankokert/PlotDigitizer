@@ -39,20 +39,23 @@ def write_grid_debug_png(
     grid_gray: Optional[np.ndarray] = None,
     ink: Optional[np.ndarray] = None,
     arrow_mask: Optional[np.ndarray] = None,
+    arrow_gray: Optional[np.ndarray] = None,
     on_grid: float = 0.15,
 ) -> None:
     """
-    Write a **pixel-exact** PNG of the reconstructed **mathematical grid** over
-    the original, so the model can be checked directly.
+    Write a **pixel-exact** PNG of the reconstructed **mathematical grid** and
+    the **parametric arrow model** over the original, so the models can be
+    checked directly.
 
     Colours (canvas coords, offset into the full image; one screen pixel per
-    image pixel — no blending):
+    image pixel):
 
-    * RED   – a modeled grid line that coincides with ink (grid actually there),
-    * GREEN – a modeled grid line where the original is white: the grid was
-      subtracted "without effect" — i.e. an interruption (a white legend box).
-      This difference is a free negative for locating such boxes.
-    * BLUE  – suppressed annotation-arrow pixels.
+    * RED    – a modeled grid line that coincides with ink (grid actually there),
+    * GREEN  – a modeled grid line where the original is white: the grid was
+      subtracted "without effect" — an interruption (a white legend box).
+    * BLUE   – suppressed annotation-arrow pixels.
+    * ORANGE – the anti-aliased arrow **model** coverage (the reconstructed
+      triangular head + shaft "sector graphic"), blended by its coverage.
     """
     from PIL import Image
 
@@ -70,6 +73,15 @@ def write_grid_debug_png(
     if arrow_mask is not None:
         ys, xs = np.where(arrow_mask)
         base[ys + y_min, xs + x_min] = (0, 90, 230)
+    if arrow_gray is not None:
+        # Blend the model coverage over the base as translucent orange so the
+        # anti-aliased sector shape (and how well it hugs the ink) is visible.
+        ys, xs = np.where(arrow_gray > 0.02)
+        if len(xs):
+            a = arrow_gray[ys, xs][:, None]
+            col = np.array([255.0, 140.0, 0.0])
+            px = base[ys + y_min, xs + x_min].astype(np.float32)
+            base[ys + y_min, xs + x_min] = (px * (1 - a) + col * a).astype(np.uint8)
     Image.fromarray(base).save(out_path)
     logger.info(f"Grid debug PNG written to: {out_path}")
 

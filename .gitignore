@@ -14,3 +14,4 @@ wheels/
 # Debug artifacts (generated)
 *_grid.png
 *_grid.json
+*_arrows.json
