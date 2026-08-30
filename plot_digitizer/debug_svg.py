@@ -32,6 +32,48 @@ def _xml_escape(text: str) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def write_grid_debug_png(
+    image_path: Path,
+    out_path: Path,
+    plot_area: tuple[int, int, int, int],
+    grid_gray: Optional[np.ndarray] = None,
+    ink: Optional[np.ndarray] = None,
+    arrow_mask: Optional[np.ndarray] = None,
+    on_grid: float = 0.15,
+) -> None:
+    """
+    Write a **pixel-exact** PNG of the reconstructed **mathematical grid** over
+    the original, so the model can be checked directly.
+
+    Colours (canvas coords, offset into the full image; one screen pixel per
+    image pixel — no blending):
+
+    * RED   – a modeled grid line that coincides with ink (grid actually there),
+    * GREEN – a modeled grid line where the original is white: the grid was
+      subtracted "without effect" — i.e. an interruption (a white legend box).
+      This difference is a free negative for locating such boxes.
+    * BLUE  – suppressed annotation-arrow pixels.
+    """
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        base = np.array(im.convert("RGB"))
+    x_min, y_min = plot_area[0], plot_area[1]
+    if grid_gray is not None:
+        math_grid = grid_gray > on_grid
+        present = math_grid & ink if ink is not None else math_grid
+        anomaly = math_grid & ~ink if ink is not None else np.zeros_like(math_grid)
+        ys, xs = np.where(present)
+        base[ys + y_min, xs + x_min] = (230, 0, 0)
+        ys, xs = np.where(anomaly)
+        base[ys + y_min, xs + x_min] = (0, 200, 0)
+    if arrow_mask is not None:
+        ys, xs = np.where(arrow_mask)
+        base[ys + y_min, xs + x_min] = (0, 90, 230)
+    Image.fromarray(base).save(out_path)
+    logger.info(f"Grid debug PNG written to: {out_path}")
+
+
 def _image_data_uri(image_path: Path) -> tuple[str, int, int]:
     """Return (data-URI, width, height) for the source image."""
     from PIL import Image

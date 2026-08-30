@@ -79,9 +79,9 @@ def digitize_plot(
     if n_curves == 0:
         logger.warning("No curves detected — check image or try --verbose")
 
-    # 4b. Optional debug SVG overlay
+    # 4b. Optional debug SVG overlay + pixel-exact grid PNG
     if debug_svg:
-        from .debug_svg import write_debug_svg
+        from .debug_svg import write_debug_svg, write_grid_debug_png
         write_debug_svg(
             image_path=image_path,
             out_path=debug_svg,
@@ -96,6 +96,20 @@ def digitize_plot(
             x_ticks=(debug or {}).get("x_ticks"),
             y_ticks=(debug or {}).get("y_ticks"),
         )
+        write_grid_debug_png(
+            image_path=image_path,
+            out_path=debug_svg.with_name(debug_svg.stem + "_grid.png"),
+            plot_area=plot_area,
+            grid_gray=(debug or {}).get("grid_gray"),
+            ink=(debug or {}).get("ink"),
+            arrow_mask=(debug or {}).get("arrow_mask"),
+        )
+        grid_model = (debug or {}).get("grid_model")
+        if grid_model is not None:
+            import json
+            json_path = debug_svg.with_name(debug_svg.stem + "_grid.json")
+            json_path.write_text(json.dumps(grid_model, indent=2), encoding="utf-8")
+            logger.info(f"Grid model JSON written to: {json_path}")
 
     # 5. Convert pixel → data coordinates and collect rows
     rows: list[tuple[str, float, float]] = []

@@ -10,3 +10,7 @@ wheels/
 .venv
 *.csv
 *.svg
+
+# Debug artifacts (generated)
+*_grid.png
+*_grid.json

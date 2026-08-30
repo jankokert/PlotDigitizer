@@ -59,6 +59,8 @@ def extract_curves(
         color_tolerance=color_tolerance,
         debug=debug,
     )
+    if debug is not None and debug.get("grid_model") is not None:
+        debug["grid_model"]["pixel_origin"] = [x_min, y_min]
 
     # Keep only the top-N masks by pixel count (skip when the user picked colours)
     if target_colors is None and n_curves is not None and len(color_masks) > n_curves:
@@ -133,22 +135,43 @@ def _segment_by_color(
     # Detect and suppress grid pixels before any further analysis
     arrows: list[dict] = []
     bridge = np.zeros(canvas.shape[:2], dtype=bool)
+    label_arrows: list[dict] = []
+    _ocr_labels: list[dict] = []
+    arrow_mask = np.zeros(canvas.shape[:2], dtype=bool)
+    grid_gray = np.zeros(canvas.shape[:2], dtype=np.float32)
     if has_grid:
-        grid_mask, arrows, bridge = _detect_grid(s, v, canvas.shape[:2], span_frac=span_frac)
-        logger.info(f"Grid pixels suppressed: {int(grid_mask.sum())}")
+        # 1-pass: reconstruct the mathematical grid and subtract it in grayscale
+        # (curves darker than the modeled grid survive the crossings).
+        from .grid_model import model_grid
+        grid_mask, grid_gray, grid_obj = model_grid(s, v)
+        logger.info(
+            f"Grid: x={grid_obj.x.scale}({len(grid_obj.x.lines_px)} lines) "
+            f"y={grid_obj.y.scale}({len(grid_obj.y.lines_px)} lines); "
+            f"{int(grid_mask.sum())} px suppressed"
+        )
+        if debug is not None:
+            debug["grid_model"] = grid_obj.to_dict()
+        # Then subtract annotation-arrow shafts (they survive as they are darker
+        # than the grid and derail the tracer where they cross a curve); the
+        # removal is crossing-protected so no gap is punched.  (OCR ~4 s.)
+        from .annotation_detector import detect_text_labels_ocr, detect_arrows
+        _ink0 = (s < 0.30) & (v < 0.90)
+        _ocr_labels = detect_text_labels_ocr(canvas)
+        label_arrows = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        if label_arrows:
+            arrow_mask = _arrow_removal_mask(label_arrows, _ink0)
+            grid_mask |= arrow_mask
     else:
         grid_mask = np.zeros(canvas.shape[:2], dtype=bool)
     if debug is not None:
-        from .annotation_detector import (
-            detect_legend_boxes, expand_to_white, detect_grid_boxes,
-            detect_text_labels_ocr, detect_arrows,
-        )
+        from .annotation_detector import detect_legend_boxes, expand_to_white, detect_grid_boxes
         _ink = (s < 0.30) & (v < 0.90)
         debug["grid_mask"] = grid_mask
+        debug["grid_gray"] = grid_gray
+        debug["ink"] = _ink
         debug["arrows"] = arrows
-        # Annotation arrows via OCR labels + solid arrowheads (general, diagonal).
-        _ocr_labels = detect_text_labels_ocr(canvas)
-        debug["label_arrows"] = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        debug["arrow_mask"] = arrow_mask
+        debug["label_arrows"] = label_arrows
         # Text-label boxes = clean OCR word boxes (glyph clustering merged whole
         # label rows into bogus mega-boxes; word OCR gives one tight box each).
         tboxes = [lab["box"] for lab in _ocr_labels]
@@ -392,216 +415,45 @@ def _run_length(mask: np.ndarray, axis: int) -> np.ndarray:
     return length
 
 
-def _detect_grid(
-    s: np.ndarray,
-    v: np.ndarray,
-    shape: tuple[int, int],
-    span_frac: float = 0.55,
-    grid_thick: int = 3,
-) -> np.ndarray:
+def _arrow_removal_mask(arrows: list[dict], ink: np.ndarray,
+                        cross_thick: int = 8) -> np.ndarray:
     """
-    Identify grid / spine pixels to suppress before curve extraction.
+    Mask the horizontal callout-arrow shafts for subtraction, **sparing curve
+    crossings** so no gap is punched in the data curve.
 
-    Grid lines are separated from the data curve **geometrically**, not by
-    colour — essential for datasheet plots where grid and curve are both black.
-
-    The key idea (thickness-aware removal): a grid line spans (almost) the full
-    axis but is *thin* (≤ grid_thick px), while the data curve is *thick* in
-    every orientation.  So within a flagged grid row we delete only the thin
-    ink; the thick curve crossing it is kept.  A line spanning nearly the whole
-    axis is removed whole (even if thick — log decade lines are drawn heavier).
-
-    `grid_thick` is the maximum grid-line thickness in pixels.
+    Walk each arrow tail→tip.  At every column the local vertical ink run is the
+    line thickness there: a bare arrow shaft is only ~4–5 px tall, a (near-)
+    vertical curve crossing the shaft is much taller.  Columns thicker than
+    ``cross_thick`` are a curve and kept; the rest are the arrow and removed —
+    only the measured core, leaving the outermost aliased row on each side.
+    Nothing is hardcoded per file; the band comes from the pixels.
     """
-    h, w = shape
-
-    # Any achromatic mark, light *or* dark (grid, frame, curve all qualify).
-    ink = (s < 0.30) & (v < 0.90)
-    vrun = _run_length(ink, axis=0)
-    hrun = _run_length(ink, axis=1)
-    thin_v = vrun <= grid_thick
-    thin_h = hrun <= grid_thick
-
-    grid_mask = np.zeros((h, w), dtype=bool)
-
-    # Full-span lines are grid regardless of thickness (a curve never fills a
-    # whole row/column).
-    solid_span = 0.92
-    grid_mask |= (ink.sum(axis=1) > w * solid_span)[:, None] & ink
-    grid_mask |= (ink.sum(axis=0) > h * solid_span)[None, :] & ink
-
-    # Partial-span lines: delete only the thin ink, keeping a thick curve.
-    full_span = 0.60
-    grid_mask |= (ink.sum(axis=1) > w * full_span)[:, None] & ink & thin_v
-    grid_mask |= (ink.sum(axis=0) > h * full_span)[None, :] & ink & thin_h
-
-    # --- Thin border spines --------------------------------------------
-    edge = 4
-    border = np.zeros((h, w), dtype=bool)
-    border[:edge, :] = True
-    border[-edge:, :] = True
-    border[:, :edge] = True
-    border[:, -edge:] = True
-    grid_mask |= border & ink & (thin_v | thin_h)
-
-    # --- Annotation arrows: suppress their shafts like grid lines -------
-    # Datasheet plots often carry label arrows (a thin horizontal shaft +
-    # a solid arrowhead) that cross the data curves.  The shaft is a strong
-    # horizontal distractor that derails the tracer.  Detect and suppress
-    # the shafts; the reclaim below then reconnects each curve across them.
-    arrows = _detect_arrows(ink & ~grid_mask, w, h)
-    arrow_px = np.zeros((h, w), dtype=bool)
+    h, w = ink.shape
+    mask = np.zeros((h, w), dtype=bool)
     for a in arrows:
-        grid_mask |= a["shaft_mask"]
-        arrow_px |= a["shaft_mask"]
-
-    # --- Reclaim curve pixels the grid removal punched out --------------
-    # Subtracting a grid line (or arrow shaft) leaves a small hole wherever
-    # the data curve crosses it; the tracer then wobbles across that gap.  A
-    # removed pixel that has *curve* ink on BOTH perpendicular sides is really
-    # the curve passing through — reclaim it so the tube stays solid at
-    # crossings.  (Pure grid/shaft pixels have curve ink on neither side.)
-    grid_mask &= ~_bridge_reclaim(ink & ~grid_mask, grid_mask, reach=5)
-
-    # Suppressing the head leaves a blank gap in the curve it points at.  Draw a
-    # thin synthetic connector across that gap (there is no ink left to reclaim)
-    # so the curve stays continuous and the tracer runs straight through.
-    bridge = _bridge_arrow_heads(ink & ~grid_mask, arrows, grid_mask.shape) \
-        if arrows else np.zeros((h, w), dtype=bool)
-    grid_mask &= ~bridge
-
-    return grid_mask, arrows, bridge
-
-
-def _bridge_arrow_heads(curve: np.ndarray, arrows: list[dict],
-                        shape: tuple[int, int]) -> np.ndarray:
-    """
-    Draw a thin vertical connector through each arrowhead: locate the curve the
-    arrow points at just above and below the head, and re-enable a 2 px strip
-    on the straight line between them.  This keeps that curve continuous without
-    re-adding the wide head blob.
-    """
-    h, w = shape
-    out = np.zeros((h, w), dtype=bool)
-    for a in arrows:
-        row, tip = a["row"], a["tip_x"]
-        ya, yb = row - 18, row + 18
-        ends = []
-        for probe in (ya, yb):
-            if not (0 <= probe < h):
-                ends.append(None)
+        ry = int(a["tip_y"])
+        lo = int(min(a["tip_x"], a["tail_x"]))
+        hi = int(max(a["tip_x"], a["tail_x"]))
+        for xx in range(max(0, lo), min(w, hi + 1)):
+            # snap to the shaft row (it may sit ±2 px off tip_y)
+            ryy = None
+            for dy in (0, -1, 1, -2, 2):
+                if 0 <= ry + dy < h and ink[ry + dy, xx]:
+                    ryy = ry + dy
+                    break
+            if ryy is None:
                 continue
-            xs = np.where(curve[probe])[0]
-            near = xs[np.abs(xs - tip) <= 20]
-            ends.append(int(near[np.argmin(np.abs(near - tip))]) if near.size else None)
-        if ends[0] is None or ends[1] is None:
-            continue
-        n = yb - ya + 1
-        line_x = np.linspace(ends[0], ends[1], n)
-        line_y = np.linspace(ya, yb, n)
-        for xx, yy in zip(line_x, line_y):
-            ri, ci = int(round(yy)), int(round(xx))
-            out[max(0, ri - 1):ri + 2, max(0, ci - 1):ci + 2] = True
-    return out
+            up = 0
+            while ryy - up - 1 >= 0 and ink[ryy - up - 1, xx]:
+                up += 1
+            dn = 0
+            while ryy + dn + 1 < h and ink[ryy + dn + 1, xx]:
+                dn += 1
+            if up + dn + 1 > cross_thick:      # a curve crosses here → keep
+                continue
+            mask[ryy - up + 1:ryy + dn, xx] = True   # core, spare aliased edges
+    return mask
 
-
-def _bridge_reclaim(curve: np.ndarray, grid_mask: np.ndarray, reach: int = 5) -> np.ndarray:
-    """
-    Return the subset of `grid_mask` pixels that bridge a curve gap.
-
-    A removed pixel is reclaimed when curve ink lies within `reach` px on both
-    sides along either the vertical or the horizontal axis — i.e. the curve
-    genuinely runs through it and the grid merely crossed on top.
-    """
-    above = np.zeros_like(curve)
-    below = np.zeros_like(curve)
-    left = np.zeros_like(curve)
-    right = np.zeros_like(curve)
-    for dk in range(1, reach + 1):
-        above[dk:, :] |= curve[:-dk, :]
-        below[:-dk, :] |= curve[dk:, :]
-        left[:, dk:] |= curve[:, :-dk]
-        right[:, :-dk] |= curve[:, dk:]
-    return grid_mask & ((above & below) | (left & right))
-
-
-def _detect_arrows(curve: np.ndarray, w: int, h: int) -> list[dict]:
-    """
-    Find annotation arrows (thin horizontal shaft + solid arrowhead) in the
-    curve ink after grid removal.
-
-    An arrow shaft is a long, dead-straight, thin *horizontal* line that is not
-    a grid line (grid is already gone).  It is told apart from a flat data-curve
-    tail by a **solid arrowhead** at one end: the arrowhead is a filled triangle,
-    so locally the ink is dense (a 2-D blob) whereas a line is sparse.
-
-    Returns a list of dicts: {shaft_mask, row, x_from, x_to, tip_x, tip_dir,
-    tail_x} in canvas pixel coords.  `tip_dir` is -1 if the head points left
-    (tip at x_from) else +1; `tail_x` is the label end.
-    """
-    from scipy import ndimage
-
-    hrun = _run_length(curve, axis=1)
-    vrun = _run_length(curve, axis=0)
-    min_len = max(60, int(0.08 * w))
-    bridge = max(40, int(0.10 * w))   # close gaps the crossing curves punch
-
-    # Dense ink = filled 2-D region (arrowhead), not a 1-2 px line.
-    fill = ndimage.uniform_filter(curve.astype(np.float32), size=7)
-    dense = curve & (fill >= 0.45)
-
-    # Locally-horizontal thin ink (shaft fragments); the vertical curves have a
-    # tiny horizontal run and are excluded.  Close along x to merge the shaft
-    # across the gaps where curves cross it, then label.
-    hseg = curve & (hrun >= 8) & (vrun <= 4)
-    se = np.ones((1, 2 * bridge + 1), dtype=bool)
-    hclosed = ndimage.binary_closing(hseg, structure=se)
-    lbl, n = ndimage.label(hclosed, structure=np.ones((3, 3), dtype=int))
-    arrows: list[dict] = []
-    for i in range(1, n + 1):
-        comp = lbl == i
-        ys, xs = np.where(comp)
-        x_from, x_to = int(xs.min()), int(xs.max())
-        y_lo, y_hi = int(ys.min()), int(ys.max())
-        if (x_to - x_from) < min_len or (y_hi - y_lo) > 6:
-            continue  # not a straight horizontal line
-        row = int(round(ys.mean()))
-        # Arrowhead: a dense (filled-triangle) blob within ~16 px of one end.
-        tip_dir, tip_x = 0, x_from
-        for xe, d in ((x_from, -1), (x_to, +1)):
-            xa = max(0, xe - 2) if d > 0 else max(0, xe - 16)
-            xb = min(w, xe + 17) if d > 0 else min(w, xe + 3)
-            if dense[max(0, row - 14):row + 15, xa:xb].sum() >= 6:
-                tip_dir, tip_x = d, xe
-                break
-        if tip_dir == 0:
-            continue  # a bare horizontal line with no head — leave it alone
-        # Suppress the shaft (thin horizontal ink over its span) plus the dense
-        # arrowhead blob near the tip.  The thin (non-dense) vertical curve that
-        # the shaft crosses or the head points at is left intact.
-        # Suppress the thin-horizontal shaft ink over its span plus the dense
-        # arrowhead blob near the tip.  The vertical data curves have a large
-        # vertical run, are not in `hseg`, and survive untouched.
-        band = np.zeros_like(curve)
-        band[max(0, row - 4):row + 5, x_from:x_to + 1] = True
-        head = np.zeros_like(curve)
-        head[max(0, row - 14):row + 15,
-             max(0, tip_x - 18):min(w, tip_x + 19)] = True
-        shaft_mask = (hseg & band) | (dense & head)
-        arrows.append({
-            "shaft_mask": shaft_mask,
-            "row": row, "x_from": x_from, "x_to": x_to,
-            "tip_x": tip_x, "tip_dir": tip_dir,
-            "tail_x": x_to if tip_dir < 0 else x_from,
-        })
-    if arrows:
-        logger.info(f"Annotation arrows detected: {len(arrows)}")
-    return arrows
-
-
-# ---------------------------------------------------------------------------
-# Naive extraction: per-column tight-cluster median + outlier filter + spline
-# ---------------------------------------------------------------------------
 
 def _tight_cluster_median(
     active: np.ndarray,
