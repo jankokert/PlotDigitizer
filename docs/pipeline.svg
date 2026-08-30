@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 200" font-family="'Segoe UI',Helvetica,Arial,sans-serif">
+  <style>
+    .ink{fill:#1b2733}.mut{fill:#5b6b7b}.sm{font-size:11px}.st{font-size:13px;font-weight:700}
+  </style>
+  <rect x="0" y="0" width="900" height="200" fill="#ffffff"/>
+  <text x="24" y="30" class="ink" font-size="17" font-weight="700">Pipeline</text>
+
+  <g>
+    <!-- stage boxes -->
+    <g transform="translate(24,56)">
+      <rect width="150" height="96" rx="8" fill="#f4f6f8" stroke="#d0d7de"/>
+      <text x="12" y="26" class="ink st">1 · Canvas</text>
+      <text x="12" y="48" class="mut sm">detect_plot_area</text>
+      <text x="12" y="66" class="mut sm">longest dark runs</text>
+      <text x="12" y="82" class="mut sm">→ axis-bounded box</text>
+    </g>
+    <g transform="translate(198,56)">
+      <rect width="150" height="96" rx="8" fill="#f4f6f8" stroke="#d0d7de"/>
+      <text x="12" y="26" class="ink st">2 · Axes</text>
+      <text x="12" y="48" class="mut sm">read_axes (OCR)</text>
+      <text x="12" y="66" class="mut sm">auto lin / log₁₀</text>
+      <text x="12" y="82" class="mut sm">robust tick fit</text>
+    </g>
+    <g transform="translate(372,56)">
+      <rect width="176" height="96" rx="8" fill="#eefaf7" stroke="#2a9d8f"/>
+      <text x="12" y="26" class="ink st">3 · Grid model</text>
+      <text x="12" y="48" class="mut sm">fit parametric lattice</text>
+      <text x="12" y="66" class="mut sm">re-draw &amp; subtract</text>
+      <text x="12" y="82" class="mut sm">measure stroke widths</text>
+    </g>
+    <g transform="translate(572,56)">
+      <rect width="176" height="96" rx="8" fill="#eefaf7" stroke="#2a9d8f"/>
+      <text x="12" y="26" class="ink st">4 · Trace curves</text>
+      <text x="12" y="48" class="mut sm">arc-length follower</text>
+      <text x="12" y="66" class="mut sm">walkable-map guard</text>
+      <text x="12" y="82" class="mut sm">handles steep + crossings</text>
+    </g>
+    <g transform="translate(772,56)">
+      <rect width="104" height="96" rx="8" fill="#f4f6f8" stroke="#d0d7de"/>
+      <text x="12" y="26" class="ink st">5 · Emit</text>
+      <text x="12" y="48" class="mut sm">pixel→data</text>
+      <text x="12" y="66" class="mut sm">CSV</text>
+      <text x="12" y="82" class="mut sm">+ debug files</text>
+    </g>
+    <!-- arrows -->
+    <g stroke="#5b6b7b" stroke-width="2" fill="none">
+      <path d="M176,104 L196,104" marker-end="url(#p)"/>
+      <path d="M350,104 L370,104" marker-end="url(#p)"/>
+      <path d="M550,104 L570,104" marker-end="url(#p)"/>
+      <path d="M750,104 L770,104" marker-end="url(#p)"/>
+    </g>
+  </g>
+  <text x="372" y="182" class="mut sm">Teal stages are what this fork adds on top of the original per-column extractor.</text>
+  <defs>
+    <marker id="p" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#5b6b7b"/>
+    </marker>
+  </defs>
+</svg>

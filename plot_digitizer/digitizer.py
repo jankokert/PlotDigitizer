@@ -77,7 +77,7 @@ def digitize_plot(
     logger.info(f"Curves found: {n_curves}  (method={method})")
 
     if n_curves == 0:
-        logger.warning("No curves detected — check image or try --verbose")
+        logger.warning("No curves detected — check image or try --debug-files")
 
     # 4b. Optional debug SVG overlay + pixel-exact grid PNG
     if debug_svg:

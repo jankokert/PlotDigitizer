@@ -51,11 +51,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--method",
-        choices=["naive", "cv", "trace"],
-        default="naive",
-        help="Curve extraction: 'naive' = per-column spline, 'cv' = OpenCV "
-             "skeleton, 'trace' = arc-length curve following (handles steep "
-             "parts and crossings)",
+        choices=["trace", "naive", "cv"],
+        default="trace",
+        help="Curve extraction: 'trace' = arc-length curve following (default; "
+             "handles steep parts and crossings), 'naive' = per-column spline, "
+             "'cv' = OpenCV skeleton",
     )
     parser.add_argument(
         "--x-range",
@@ -90,8 +90,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--grid",
-        action="store_true",
-        help="Plot has a grid — suppress grid lines before curve extraction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress grid lines before curve extraction (on by default; "
+             "use --no-grid for grid-less plots)",
     )
     parser.add_argument(
         "--smoothing",
@@ -165,18 +167,18 @@ def main() -> None:
         help="Max Euclidean RGB distance for --color matching (anti-aliasing / JPEG)",
     )
     parser.add_argument(
-        "--debug-svg",
+        "--debug-files",
         nargs="?",
         const=True,
         default=None,
         metavar="PATH",
-        help="Write a debug SVG (source image + plot box + suppressed grid + "
-             "extracted points). Optional PATH; defaults to <output>_debug.svg",
+        help="Write debug artefacts (SVG overlay + grid PNG + grid/arrow JSON) "
+             "and enable verbose logging. Optional PATH sets the SVG name; "
+             "defaults to <output>_debug.svg",
     )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
-    setup_logging(args.verbose)
+    setup_logging(verbose=args.debug_files is not None)
     logger = logging.getLogger(__name__)
 
     image_path = Path(args.image)
@@ -198,11 +200,11 @@ def main() -> None:
             sys.exit(1)
 
     debug_svg_path = None
-    if args.debug_svg is not None:
-        if args.debug_svg is True:
+    if args.debug_files is not None:
+        if args.debug_files is True:
             debug_svg_path = output_path.with_name(output_path.stem + "_debug.svg")
         else:
-            debug_svg_path = Path(args.debug_svg)
+            debug_svg_path = Path(args.debug_files)
 
     from .digitizer import digitize_plot
 

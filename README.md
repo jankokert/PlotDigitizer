@@ -1,8 +1,113 @@
 # PlotDigitizer
 
-Convert a 2-D plot image into a CSV file of numeric (x, y) data points.
-Works on PNG, JPEG, and most common raster formats.
-Handles multiple coloured curves, overlapping curves, grid lines, and noisy or low-quality scans.
+**Turn a plot image back into the numbers behind it — even a pure black-and-white datasheet scan.**
+
+Convert a 2-D plot image into a CSV of numeric `(x, y)` data points. Works on PNG, JPEG and
+most raster formats, handles multiple curves, overlapping curves, grids, log axes, annotation
+arrows and noisy scans.
+
+> This is a fork focused on the hard case that colour-based digitizers give up on:
+> **monochrome engineering plots** where the curves, the grid and the arrows are all the same
+> black ink. Instead of separating by colour, it **reconstructs the grid mathematically**,
+> measures **stroke widths** to tell ink apart, and **traces each curve by arc length** so steep
+> segments and crossings survive.
+
+<p align="center">
+  <img src="docs/cmz-original.png" width="46%" alt="Original black-and-white datasheet plot">
+  &nbsp;&nbsp;
+  <img src="docs/cmz-grid-reconstruction.png" width="46%" alt="Reconstructed grid (red) overlaid on the extracted curves">
+</p>
+<p align="center"><em>Left: the raw datasheet scan (10 black curves, semi-log grid, callout arrows). Right: the
+grid re-drawn from a fitted parametric model (red) — including the minor lines hidden under the labels
+at the top — with the 10 curves cleanly separated.</em></p>
+
+---
+
+## What this fork adds
+
+| Capability | Why it matters |
+|------------|----------------|
+| **Runs on black-and-white plots** | Curves, grid and arrows share one colour; colour segmentation fails. This fork separates them by *geometry and stroke width* instead. |
+| **Mathematical grid reconstruction** | The grid is fit as a parametric lattice (linear **or** log₁₀, sub-pixel). Missing lines — even ones hidden under text — are restored, then subtracted so they never pollute the curves. |
+| **Stroke-width hierarchy** | `minor-grid < major-grid < plot-line < arrow-base`, measured chart-wide. A single robust discriminator for what is grid, what is curve, and what is an arrowhead. |
+| **Arc-length curve tracing** | The `trace` method follows a curve like a pen, so near-vertical segments and curve-to-curve crossings are handled — where a per-column scan smears them. |
+| **Walkable-map trace guard** | Tracing may bridge *erased* pixels (subtracted grid/arrows) but **never white space** — so a curve can't jump across a gap into a neighbouring arrow. |
+| **Auto log-axis calibration** | OCR ticks are fit in both linear and log₁₀ space; the axis type is detected automatically. |
+| **Debug artefacts** | One flag emits an SVG overlay, a pixel-exact grid PNG, and JSON of the fitted grid/arrow models and measured widths. |
+
+---
+
+## Highlight — black-and-white plots
+
+A datasheet plot like the one above breaks the usual approach: every stroke is the same black, so
+"segment by hue" yields nothing, and the dense grid is indistinguishable from the data by colour
+alone. This fork treats it as a **reconstruction** problem rather than a colour problem:
+
+1. **Model the grid, don't chase pixels.** A grid is regular by construction, so it is described by
+   a few numbers (spacing, phase, axis type). Fit those, re-draw the grid at sub-pixel accuracy, and
+   subtract it — leaving the curves behind. See *[Grid as a parametric lattice](#grid-as-a-parametric-lattice)*.
+2. **Use stroke width to tell ink apart.** Grid lines are thinner than curves, which are thinner than
+   arrowheads. Measuring these widths gives a clean, colour-free discriminator. See
+   *[Stroke-width hierarchy](#stroke-width-hierarchy)*.
+3. **Trace each curve by arc length**, constrained to originally-inked pixels, so overlapping black
+   curves stay separate instead of merging.
+
+Result on the CMZ54xxB Zener datasheet: **10 curves separated cleanly** on a plot with **zero colour
+information**.
+
+---
+
+## How it works
+
+![Pipeline](docs/pipeline.svg)
+
+### Grid as a parametric lattice
+
+A grid is not random ink — it is a lattice with a fixed spacing, so it is fully described by a couple
+of parameters. The reconstructor fits them by least squares, then re-draws every line, including the
+ones the scan never showed because a label sat on top of them.
+
+![Grid reconstruction](docs/grid-reconstruction.svg)
+
+- **Axis type is detected** (linear vs log₁₀). On a log axis the decade width `W` (in pixels) is
+  constant, and the minor lines within a decade sit at `mᵢ = log₁₀(1…9)`.
+- Every grid line is at `cₖ = anchor + W·(mᵢ + k)` for integer decade index `k`. Two parameters
+  (`W`, `anchor`) are fit to the detected line positions with outlier rejection, so a handful of
+  clearly-visible lines pin down the entire grid — even where it is occluded.
+- Lines are re-rendered at their sub-pixel position with a consistent per-class width (minor vs
+  major), then subtracted from the image so curve extraction never sees them.
+- The frame/spine is drawn at the major-line width, and the canvas crop keeps the outer border pixel
+  so outward ticks are not clipped.
+
+### Stroke-width hierarchy
+
+When colour carries no information, **line thickness does**. Widths are measured chart-wide as twice
+the median of the distance-transform ridge, and they come out reliably ordered:
+
+![Stroke-width hierarchy](docs/width-hierarchy.svg)
+
+Because `arrow-base > plot-line > major-grid > minor-grid`, the same measurement decides what is a
+grid line to subtract, what is a curve to trace, and what is an arrowhead to remove. The measured
+widths are printed to the log and written into the debug JSON.
+
+### Arc-length curve tracing (`--method trace`, default)
+
+Instead of taking one sample per x-column (which smears near-vertical parts and mishandles
+crossings), the tracer walks along the curve: at each step it looks in a forward cone and steps to the
+local ink centroid, following the stroke like a pen. A U-turn guard stops it from doubling back at an
+endpoint.
+
+Crucially, stepping is constrained by a **walkable map** — the set of pixels that were originally
+inked (before the grid and arrows were subtracted). The tracer may cross *erased* pixels to bridge a
+gap where a grid line used to cut through a curve, but it will **never cross genuinely white space**.
+That single rule stops a curve from leaping across a blank gap into a nearby callout arrow.
+
+### Annotation-arrow model
+
+Callout arrows are reconstructed with a parametric triangular-head + straight-shaft model whose style
+(head length, angle, base width) is shared chart-wide, then subtracted so their ink does not attach to
+the curves they point at. Detection is anchored on OCR'd labels; the fitted model and measured widths
+are written to `<stem>_arrows.json`.
 
 ---
 
@@ -36,100 +141,34 @@ Optional flags: `--host 0.0.0.0 --port 8080 --reload`
 # Install with uv (recommended)
 uv pip install -e .
 
-# Basic usage — OCR reads the axis labels automatically
+# Basic usage — grid suppression + arc-length tracing are on by default,
+# OCR reads (and auto-detects lin/log) the axis labels
 uv run plot_digitizer --image path/to/plot.png
 
 # Provide axis ranges manually (bypasses OCR, more reliable)
-uv run plot_digitizer --image plot.png --x-range 0 10 --y-range -1.5 1.5
+uv run plot_digitizer --image plot.png --x-range 0 14 --y-range 0.1 10000
 
-# Save a comparison figure alongside the CSV
-uv run plot_digitizer --image plot.png --x-range 0 10 --y-range -1.5 1.5 --plot
+# A grid-less plot: turn grid suppression off
+uv run plot_digitizer --image scatter.png --no-grid
+
+# Emit all debug artefacts (SVG overlay + grid PNG + JSON) with verbose logging
+uv run plot_digitizer --image plot.png --debug-files
 ```
 
 Output is written next to the image as `plot.csv` (columns: `curve`, `x`, `y`).
 
----
+### Debug artefacts (`--debug-files`)
 
-## Pipeline overview
+`--debug-files [PATH]` turns on verbose logging and writes, next to the output CSV:
 
-```
-Image file
-    │
-    ▼
-1. detect_plot_area()   — locate the axis-bounded canvas
-    │
-    ▼
-2. read_axes()          — calibrate pixel ↔ data-value mapping
-    │
-    ▼
-3. extract_curves()     — segment by colour, extract (x, y) pixel paths
-    │
-    ▼
-4. pixel_to_data()      — convert pixel coords to data coords
-    │
-    ▼
-CSV  +  optional plot
-```
+| File | Contents |
+|------|----------|
+| `<stem>_debug.svg` | Source image with the detected canvas, extracted curve points, arrows and labels overlaid |
+| `<stem>_debug_grid.png` | Pixel-exact overlay of the **reconstructed grid** (red), arrows (blue) and text boxes (green) |
+| `<stem>_debug_grid.json` | The fitted grid model — axis type, spacing, phase, minor/major widths |
+| `<stem>_debug_arrows.json` | The fitted arrow model and the measured stroke widths (`widths_px`) |
 
-### Stage 1 — Canvas detection (`plot_detector.py`)
-
-The detector looks for long continuous dark runs of pixels (axis spines) that span
-at least 30 % of the image width or height.  It tries progressively more permissive
-darkness thresholds (80 → 120 → 160 → 200 → 230) so that both dark and light-grey
-axes are found.  If no spines are found, it falls back to a 12 %/88 % margin crop.
-
-### Stage 2 — Axis calibration (`axis_reader.py`)
-
-**OCR mode (default):** crops the strip below (x-axis) and to the left (y-axis) of
-the canvas and runs Tesseract OCR (3× upscaled, numeric characters only) to find
-tick labels.  Two anchor points define a linear calibration.
-
-**Manual mode (`--x-range` / `--y-range`):** skips OCR entirely and uses the
-provided numbers directly.  Always more reliable than OCR; use it whenever the axis
-labels are non-standard, too small, or partly occluded.
-
-**Y-axis convention:** `--y-range Y_MIN Y_MAX` where Y_MIN is the *bottom* value
-and Y_MAX is the *top* value, matching the natural reading of a plot.
-Internally pixel y increases downward while data y increases upward, so the
-calibration automatically inverts the mapping.
-
-### Stage 3 — Curve extraction (`curve_extractor.py`)
-
-#### Colour segmentation
-
-1. Convert the canvas to HSV.
-2. Optionally suppress grid lines: achromatic rows/columns spanning ≥ `--span-frac`
-   of the canvas are masked out, plus a fixed border margin covering tick marks.
-3. Saturated foreground pixels (`saturation > --sat-threshold`, `value > 0.15`) are
-   grouped into hue bins of width `360 / --hue-bins` degrees.
-4. Each bin that spans at least `--min-col-coverage` fraction of canvas columns is
-   kept as a candidate curve.
-5. A separate pass finds achromatic (grey) curves in 8 value bins between 0.25 and
-   0.90, merging bins with >60 % column overlap.
-6. If `--n-curves N` is given, only the top-N segments by pixel count are kept.
-
-#### Naive method (default, `--method naive`)
-
-For each x-column of the colour mask:
-
-1. Collect all active (foreground) pixel rows.
-2. **Tight-cluster median** — find the window of height ≤ `--max-thickness` px
-   containing the most pixels via a sliding window, then return its median y.
-3. **Deep-notch mode** — if the column spread exceeds `max-thickness × notch-factor`
-   *and* the pixel density in that spread is > 0.4 (i.e. a dense near-vertical
-   segment, not sparse noise), snap to the bottom-most pixel to capture resonance
-   minima faithfully.
-4. Outlier rejection: replace column medians deviating > 3 MAD from their
-   21-column neighbourhood with the local median.
-5. Fit a smoothing spline (scipy `UnivariateSpline`, degree 3) with smoothing
-   parameter `s = n_points × 0.5 × --smoothing`, then sample `--n-samples` evenly
-   spaced output points.
-
-#### CV method (`--method cv`)
-
-Requires `opencv-python`.  Computes a morphological skeleton of each colour mask,
-then takes the per-column median of skeleton pixels.  Falls back to the naive method
-if OpenCV is not available.
+Pass an optional path (`--debug-files out/run1.svg`) to name the SVG; the siblings follow its stem.
 
 ---
 
@@ -143,22 +182,32 @@ uv run plot_digitizer --image IMAGE [options]
 |--------|---------|-------------|
 | `--image PATH` | *(required)* | Input plot image |
 | `--output PATH` | `<image>.csv` | Output CSV path |
-| `--method naive\|cv` | `naive` | Extraction method |
+| `--method trace\|naive\|cv` | `trace` | Extraction method (see below) |
 | `--x-range X_MIN X_MAX` | OCR | Override x-axis range |
 | `--y-range Y_MIN Y_MAX` | OCR | Override y-axis range (bottom then top) |
-| `--n-curves N` | all | Keep only the top-N colour segments |
-| `--grid` | off | Suppress grid lines before extraction |
+| `--n-curves N` | all | Keep only the top-N colour/value segments |
+| `--grid` / `--no-grid` | **on** | Reconstruct & suppress grid lines before extraction |
+| `--color COLOR` | off | Extract only pixels near this `#rrggbb`/`r,g,b` colour (repeatable) |
+| `--color-tolerance D` | `40` | Max RGB distance for `--color` matching |
 | `--smoothing S` | `1.0` | Spline smoothing factor (higher = smoother) |
 | `--n-samples N` | `500` | Output points per curve |
 | `--sat-threshold F` | `0.20` | HSV saturation cutoff for colour detection |
 | `--min-col-coverage F` | `0.20` | Min fraction of canvas width a curve must span |
 | `--hue-bins N` | `18` | Hue bins for colour segmentation |
 | `--span-frac F` | `0.55` | Min row/column span to classify as a grid line |
-| `--max-thickness N` | auto | Max pixel cluster height per column |
-| `--notch-factor F` | `3.0` | Spread/thickness ratio that triggers notch mode |
+| `--max-thickness N` | auto | Max pixel cluster height per column (`naive`) |
+| `--notch-factor F` | `3.0` | Spread/thickness ratio that triggers notch mode (`naive`) |
 | `--plot` / `-p` | off | Save a comparison figure |
 | `--show` | off | Open interactive plot window |
-| `--verbose` / `-v` | off | Debug logging |
+| `--debug-files [PATH]` | off | Write debug SVG + grid PNG + JSON, and log verbosely |
+
+**Extraction methods**
+
+- **`trace`** *(default)* — arc-length curve following. Handles steep segments and crossings; best for
+  overlapping and monochrome curves.
+- **`naive`** — per-column tight-cluster median + smoothing spline. Fast; good for well-separated,
+  single-valued curves. Deep-notch mode captures sharp resonance minima.
+- **`cv`** — morphological skeleton (requires `opencv-python`); falls back to `naive` if unavailable.
 
 ---
 
@@ -166,192 +215,50 @@ uv run plot_digitizer --image IMAGE [options]
 
 ### Wrong axis range (most common issue)
 
-**Symptom:** all curve values are shifted or scaled incorrectly; the CSV looks like
-it spans `[0, 1]` instead of your expected range.
+**Symptom:** all curve values are shifted or scaled; the CSV looks like `[0, 1]` instead of your range.
 
-**Cause:** OCR failed to read the tick labels (too small, font not recognised, or
-non-standard notation).
+**Cause:** OCR failed to read the tick labels (too small, unusual font, non-standard notation).
 
-**Fix:** always supply ranges manually:
+**Fix:** supply ranges manually — `--y-range` is *bottom then top*:
 ```bash
 plot_digitizer --image plot.png --x-range 1500 1600 --y-range -30 0
 ```
 
----
+### Y-axis inverted
 
-### Y-axis calibration inverted
+**Symptom:** values that should be near the top appear near the bottom.
 
-**Symptom:** curves that should be near 0 dB appear near −14 dB and vice versa.
-
-**Cause:** `--y-range` arguments in wrong order.  The convention is
-`--y-range Y_MIN Y_MAX` where Y_MIN is the *bottom* of the plot and Y_MAX is the
-*top*.  Passing them reversed (e.g. `--y-range 0 -14`) inverts the mapping.
-
-**Fix:**
+**Cause:** `--y-range` arguments reversed. Convention is `--y-range Y_MIN Y_MAX` (bottom, then top).
 ```bash
-# Wrong:  --y-range 0 -14
-# Correct:
+# Wrong:  --y-range 0 -14      Correct:
 plot_digitizer --image plot.png --y-range -14 0
 ```
 
----
+### Grid lines detected as curves
 
-### Canvas boundary detected incorrectly
-
-**Symptom:** canvas is too small (cuts off part of the plot) or uses the 12 %/88 %
-fallback, causing axis calibration errors of several percent.
-
-**Cause:** light-grey axis spines (common in scientific figures) are not found at
-low darkness thresholds.  The detector now tries up to threshold=230 automatically.
-The fallback also fires when the image has no clear spine lines (e.g. borderless plots).
-
-**Fix:**
-- Supply `--x-range` and `--y-range` manually so that an imprecise canvas boundary
-  does not affect calibration.
-- Run with `--verbose` to see which threshold was used and what canvas was detected.
-
----
+Grid suppression is on by default. If remnants still appear, tune `--span-frac` (a row/column must
+span this fraction of the canvas to count as a grid line):
+```bash
+plot_digitizer --image plot.png --span-frac 0.40   # less aggressive
+plot_digitizer --image plot.png --span-frac 0.70   # more aggressive
+```
+For a plot that genuinely has no grid, use `--no-grid`.
 
 ### No curves detected
 
-**Symptom:** CSV is empty; log says "No curves detected".
+- **Pale/low-saturation colour curves:** `--sat-threshold 0.08`
+- **Curve spans a small part of the x-axis:** `--min-col-coverage 0.05`
+- **Two similar colours merged into one hue bin:** `--hue-bins 36`
+- Run `--debug-files` to see the detected canvas, axis scale, and measured widths.
 
-**Cause A — low saturation curves:** pastel or near-grey colours fall below the
-default `sat-threshold=0.20`.
+### Extra spurious curves
 
-**Fix:**
-```bash
-plot_digitizer --image plot.png --sat-threshold 0.08
-```
+Cap the output to the expected count: `--n-curves 2`.
 
-**Cause B — curve spans a small fraction of the x-axis:** the default 20 % column
-coverage requirement drops partial curves.
+### Noisy / measured data (jagged curve)
 
-**Fix:**
-```bash
-plot_digitizer --image plot.png --min-col-coverage 0.05
-```
-
-**Cause C — curves merged into one hue bin:** two similarly-coloured curves fall in
-the same hue bucket with default `hue-bins=18` (20° per bin).
-
-**Fix:**
-```bash
-plot_digitizer --image plot.png --hue-bins 36   # 10° per bin
-```
-
----
-
-### Extra spurious curves detected
-
-**Symptom:** more curves in the CSV than in the original plot; extras often
-correspond to axis tick marks, labels, or legends.
-
-**Fix:** cap the output with `--n-curves`:
-```bash
-plot_digitizer --image plot.png --n-curves 2
-```
-
----
-
-### Grid lines detected as curves
-
-**Symptom:** horizontal bands or near-flat artefacts appear in the CSV.
-
-**Fix:** enable grid suppression:
-```bash
-plot_digitizer --image plot.png --grid
-```
-
-Tune aggressiveness with `--span-frac` (default 0.55 — a row or column must span
-55 % of the canvas to be classified as a grid line):
-```bash
-# Less aggressive — keep more of the plot, risk leaving some grid remnants
-plot_digitizer --image plot.png --grid --span-frac 0.40
-
-# More aggressive — removes more rows/cols, risk clipping curve endpoints
-plot_digitizer --image plot.png --grid --span-frac 0.70
-```
-
----
-
-### Resonance notch / transmission minimum not captured (clipped too high)
-
-**Symptom:** a sharp deep dip in the curve is flattened or its minimum is much
-shallower than in the original plot.
-
-**Cause:** the per-column tight-cluster window (`--max-thickness`) is smaller than
-the notch width in pixels, so the sliding window finds a cluster above the true
-minimum instead of following the near-vertical descent.
-
-**Fix:** lower `--notch-factor` so that deep-notch mode fires sooner:
-```bash
-plot_digitizer --image plot.png --notch-factor 2.0
-```
-
-How it works: when the pixel spread in a column exceeds `max_thickness × notch-factor`
-**and** pixel density in that spread is > 40 % (confirming a dense near-vertical
-segment rather than scattered noise), the extractor snaps to the bottom-most pixel
-to capture the minimum.
-
----
-
-### Spikes or jumps in extracted curve (false notch triggering)
-
-**Symptom:** a smooth curve has sudden large spikes at certain x positions,
-especially near the edges of the plot or where another curve overlaps.
-
-**Cause A — sparse noise pixels far from the curve:** anti-aliasing, JPEG
-compression, or a nearby axis line leaves a few isolated pixels far below the main
-curve.  Their wide y-spread used to trigger notch mode incorrectly.
-
-**Status:** fixed automatically.  The density gate (`density > 0.4` required before
-notch mode fires) ensures sparse-noise columns fall through to the sliding-window
-path, which correctly finds the dense upper cluster.
-
-**Cause B — residual smoothing artefacts:** the spline overshoots at curve endpoints
-or in low-data regions.
-
-**Fix:** increase smoothing:
-```bash
-plot_digitizer --image plot.png --smoothing 3.0
-```
-
----
-
-### Thick-stroke curves extracted with wrong centre
-
-**Symptom:** a thick (e.g. 8 pt) curve is offset from its true centre; the error
-grows with line width.
-
-**Cause:** the auto thickness (`max(8, canvas_height / 25)`) is smaller than the
-rendered stroke, so the sliding window finds the top half of the stroke rather than
-its centre.
-
-**Fix:** set `--max-thickness` explicitly to at least the stroke width in pixels
-(≈ `linewidth_pt × dpi / 72`):
-```bash
-plot_digitizer --image plot.png --max-thickness 40
-```
-
----
-
-### Noisy or measured data (jagged curve)
-
-**Symptom:** extracted curve follows every noise wiggle; CSV is noisier than desired.
-
-**Fix:** increase `--smoothing` (default 1.0):
-```bash
-# Moderate noise
-plot_digitizer --image plot.png --smoothing 2.0
-
-# Heavy noise or low-quality scan
-plot_digitizer --image plot.png --smoothing 5.0
-```
-
-The spline smoothing parameter scales as `s = n_points × 0.5 × smoothing`, so
-larger values produce a smoother fit at the cost of following rapid transitions less
-closely.
+Increase `--smoothing` (default 1.0): `--smoothing 2.0` for moderate noise, `--smoothing 5.0` for heavy.
+The spline smoothing scales as `s = n_points × 0.5 × smoothing`.
 
 ---
 
@@ -361,20 +268,13 @@ closely.
 uv run python tests/run_tests.py
 ```
 
-The test suite generates synthetic plots with known ground-truth curves, runs the
-full digitization pipeline, and reports RMS error normalised by the y-range.
-The default pass threshold is 5 % of y-range; noisy tests use relaxed thresholds
-(8–12 %) set per-test.
+The suite generates synthetic plots with known ground-truth curves, runs the full pipeline, and
+reports RMS error normalised by the y-range (default pass threshold 5 %; noisy tests 8–12 %).
 
-Test categories:
-
-- **Core accuracy** — single/multi-curve, PNG/JPEG, 150/300 dpi, overlapping curves
-- **Parameter-specific** — each CLI parameter exercised in isolation
-- **Noisy data** — Gaussian noise at σ=0.05 and σ=0.15, with and without grid/JPEG
-- **Regression** — reproduces the specific failure modes fixed during development:
-  - Density-gated notch mode (fig02-style spike suppression)
-  - Notch mode discrimination between a dense resonance dip and a flat noisy curve
-  - Thin curves with sparse column pixels not snapping to wrong extremum
+Test categories: **core accuracy** (single/multi-curve, PNG/JPEG, 150/300 dpi, overlaps),
+**parameter-specific** (each CLI parameter in isolation), **noisy data** (Gaussian σ=0.05 / 0.15,
+with/without grid/JPEG), and **regression** (density-gated notch mode, notch discrimination, thin
+sparse-column curves).
 
 ---
 
@@ -384,16 +284,13 @@ Test categories:
 |---------|---------|
 | `Pillow` | Image loading |
 | `numpy` | Array operations |
-| `scipy` | Smoothing spline (`UnivariateSpline`) |
+| `scipy` | Smoothing spline, distance transform |
 | `matplotlib` | Optional result plot |
 | `pytesseract` | OCR for axis labels (optional — manual ranges bypass it) |
-| `opencv-python-headless` | CV extraction method (optional) |
+| `opencv-python-headless` | `cv` extraction method (optional) |
 
 Tesseract OCR engine must be installed separately:
 ```bash
-# Ubuntu / Debian
-sudo apt install tesseract-ocr
-
-# macOS
-brew install tesseract
+sudo apt install tesseract-ocr   # Ubuntu / Debian
+brew install tesseract           # macOS
 ```

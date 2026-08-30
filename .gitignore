@@ -15,3 +15,7 @@ wheels/
 *_grid.png
 *_grid.json
 *_arrows.json
+
+# Committed documentation assets — override the broad ignores above
+!docs/*.svg
+!docs/*.png

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 340" font-family="'Segoe UI',Helvetica,Arial,sans-serif">
+  <style>
+    .ink{fill:#1b2733}.mut{fill:#5b6b7b}.sm{font-size:12px}.tt{font-family:'Consolas',monospace}
+  </style>
+  <rect x="0" y="0" width="900" height="340" fill="#ffffff"/>
+  <text x="24" y="34" class="ink" font-size="19" font-weight="700">Stroke width is the fingerprint — it separates ink on a black-and-white plot</text>
+  <text x="24" y="56" class="mut sm">When curve, grid and arrows are all the same black, colour tells you nothing. Line <tspan font-style="italic">thickness</tspan> does. Measured chart-wide (median of the distance-transform ridge).</text>
+
+  <!-- ordered strokes -->
+  <g transform="translate(60,96)">
+    <!-- minor grid: 1px -->
+    <rect x="0" y="18" width="470" height="1.5" fill="#1b2733"/>
+    <text x="500" y="16" class="ink sm" font-weight="700">minor-grid</text>
+    <text x="500" y="32" class="mut sm tt">≈ 1 px</text>
+
+    <!-- major grid: 2px -->
+    <rect x="0" y="66" width="470" height="3" fill="#1b2733"/>
+    <text x="500" y="64" class="ink sm" font-weight="700">major-grid  /  frame</text>
+    <text x="500" y="80" class="mut sm tt">≈ 2 px</text>
+
+    <!-- plot line: 4px -->
+    <rect x="0" y="112" width="470" height="6" fill="#1b2733"/>
+    <text x="500" y="110" class="ink sm" font-weight="700">plot curve</text>
+    <text x="500" y="126" class="mut sm tt">≈ 4 px</text>
+
+    <!-- arrow base: 11px -->
+    <rect x="0" y="160" width="470" height="14" fill="#1b2733"/>
+    <text x="500" y="158" class="ink sm" font-weight="700">arrow-head base</text>
+    <text x="500" y="174" class="mut sm tt">≈ 11 px</text>
+
+    <!-- ordering bracket -->
+    <path d="M-14,10 L-22,10 L-22,182 L-14,182" fill="none" stroke="#2a9d8f" stroke-width="2"/>
+    <text x="-30" y="100" class="mut sm" transform="rotate(-90,-30,100)" text-anchor="middle" fill="#2a9d8f" font-weight="700">increasing width</text>
+  </g>
+
+  <!-- inequality -->
+  <rect x="60" y="292" width="780" height="34" rx="6" fill="#f0faf7" stroke="#2a9d8f"/>
+  <text x="450" y="314" text-anchor="middle" class="tt" font-size="14" fill="#1b6f63">minor-grid &lt; major-grid &lt; plot-line &lt; arrow-base</text>
+</svg>
