@@ -60,6 +60,14 @@ def extract_curves(
         color_tolerance=color_tolerance,
         debug=debug,
     )
+    # Walkable map: every pixel that was originally ink (dark OR coloured) — i.e.
+    # curve, grid and arrows before any removal.  The tracer may bridge a gap only
+    # across walkable pixels; a genuinely WHITE gap is never crossed, so a trace
+    # can never hop off a curve's end onto a nearby arrowhead.
+    _cmax = canvas[:, :, :3].max(axis=2) / 255.0
+    _cmin = canvas[:, :, :3].min(axis=2) / 255.0
+    _csat = np.where(_cmax > 1e-6, (_cmax - _cmin) / np.maximum(_cmax, 1e-6), 0.0)
+    walkable = (_cmax < 0.90) | (_csat > 0.25)
     if debug is not None and debug.get("grid_model") is not None:
         debug["grid_model"]["pixel_origin"] = [x_min, y_min]
 
@@ -76,7 +84,7 @@ def extract_curves(
         if method == "trace":
             # Arc-length tracing may split one mask into several curves
             # (e.g. same-colour curves that cross) — emit each as its own label.
-            paths = _extract_trace(mask, x_min, y_min)
+            paths = _extract_trace(mask, x_min, y_min, walkable)
             # Order the curves left-to-right (seg00 = leftmost) by their median x,
             # so the segment index matches the on-plot order and the legend.
             paths = [paths[i] for i in _reading_order(
@@ -693,6 +701,7 @@ def _extract_trace(
     mask: np.ndarray,
     x_offset: int,
     y_offset: int,
+    walkable: Optional[np.ndarray] = None,
 ) -> list[np.ndarray]:
     """
     Follow each curve along its arc length (not column-by-column).
@@ -729,6 +738,10 @@ def _extract_trace(
     tree = cKDTree(coords)
     covered = np.zeros(len(coords), dtype=bool)
 
+    # The walkable map (originally-ink pixels) tells the march where it may step:
+    # a gap is bridgeable only across walkable pixels, never across a white gap.
+    trav = mask if walkable is None else walkable
+
     paths: list[np.ndarray] = []
 
     while True:
@@ -750,9 +763,9 @@ def _extract_trace(
         pre = covered.copy()
         d0 = _local_direction(tree, coords, seed, search_r)
         fwd = _march(tree, coords, seed_center, d0, step, search_r,
-                     cover_r, width)
+                     cover_r, width, trav=trav)
         bwd = _march(tree, coords, seed_center, -d0, step, search_r,
-                     cover_r, width)
+                     cover_r, width, trav=trav)
         covered[tree.query_ball_point(seed, cover_r)] = True
 
         path = list(reversed(bwd)) + [seed_center] + fwd
@@ -924,8 +937,28 @@ def _local_direction(tree, coords, seed, radius) -> np.ndarray:
     return d / n if n > 1e-9 else np.array([1.0, 0.0])
 
 
+def _los_blocked(trav: np.ndarray, p: np.ndarray, q: np.ndarray) -> bool:
+    """True if the straight segment p→q crosses a non-traversable (white) pixel.
+
+    Samples the interior at ~1 px (vectorised); a clear line lies wholly in
+    curve-ink ∪ removed pixels, so the march may bridge grid/arrow gaps but never
+    a genuinely white one.
+    """
+    dx = q[0] - p[0]; dy = q[1] - p[1]
+    n = int(math.hypot(dx, dy))
+    if n <= 1:
+        return False
+    t = np.arange(1, n) / n
+    xs = np.rint(p[0] + dx * t).astype(np.intp)
+    ys = np.rint(p[1] + dy * t).astype(np.intp)
+    H, W = trav.shape
+    if xs.min() < 0 or xs.max() >= W or ys.min() < 0 or ys.max() >= H:
+        return True
+    return not trav[ys, xs].all()
+
+
 def _march(tree, coords, start, direction, step, search_r, cover_r,
-           width, max_steps: int = 6000) -> list[np.ndarray]:
+           width, max_steps: int = 6000, trav: Optional[np.ndarray] = None) -> list[np.ndarray]:
     """
     Walk from `start` along `direction`, one `step` at a time, returning the
     ordered centre-line points (excluding the start point).
@@ -995,6 +1028,15 @@ def _march(tree, coords, start, direction, step, search_r, cover_r,
         move = c - p
         dist_moved = math.hypot(move[0], move[1])
         if dist_moved < 0.5:
+            break
+
+        # Line-of-sight guard: the march may bridge a gap only across pixels it
+        # deleted (grid/arrow) — never across a genuinely white gap.  A step to a
+        # new centroid that crosses white means the curve has ended and the cone is
+        # reaching onto a neighbouring object (e.g. an arrowhead ~5 px past the
+        # tip); stop instead of hopping.  Only bigger-than-normal moves can span a
+        # real gap, so the common short step skips the check.
+        if trav is not None and dist_moved > 0.9 * step and _los_blocked(trav, p, c):
             break
 
         newd = move / dist_moved
