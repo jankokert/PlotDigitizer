@@ -50,7 +50,9 @@ def write_grid_debug_png(
     Colours (canvas coords, offset into the full image; one screen pixel per
     image pixel):
 
-    * RED    – a modeled grid line that coincides with ink (grid actually there),
+    * RED    – a modeled grid line on ink, blended by the model's **grayscale
+      strength**: a full-darkness core is solid red, a 50 %% aliased edge pixel
+      is faint red — so the sub-pixel soft profile that is subtracted is visible.
     * GREEN  – a modeled grid line where the original is white: the grid was
       subtracted "without effect" — an interruption (a white legend box).
     * BLUE   – suppressed annotation-arrow pixels.
@@ -66,8 +68,14 @@ def write_grid_debug_png(
         math_grid = grid_gray > on_grid
         present = math_grid & ink if ink is not None else math_grid
         anomaly = math_grid & ~ink if ink is not None else np.zeros_like(math_grid)
+        # Present grid: blend red proportional to the modeled grayscale strength
+        # (grid_gray in [0,1]) so weak / half-subtracted aliased pixels show faint.
         ys, xs = np.where(present)
-        base[ys + y_min, xs + x_min] = (230, 0, 0)
+        if len(xs):
+            a = np.clip(grid_gray[ys, xs], 0.0, 1.0)[:, None]
+            red = np.array([230.0, 0.0, 0.0])
+            px = base[ys + y_min, xs + x_min].astype(np.float32)
+            base[ys + y_min, xs + x_min] = (px * (1 - a) + red * a).astype(np.uint8)
         ys, xs = np.where(anomaly)
         base[ys + y_min, xs + x_min] = (0, 200, 0)
     if arrow_mask is not None:

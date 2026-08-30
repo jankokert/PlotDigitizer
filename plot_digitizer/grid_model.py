@@ -23,12 +23,14 @@ is itself a useful "negative" for locating such boxes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import numpy as np
 
 _LOG_MANT = np.log10(np.arange(1, 10))     # fractional log10 of 1..9 (minor lines)
+_LOG_MANT_MINOR = np.log10(np.arange(2, 10))   # 2..9 only (a decade line is at 0/1)
 
 
 @dataclass
@@ -75,7 +77,8 @@ def _fit_linear(pos: np.ndarray) -> Optional[dict]:
             inl[i] = False
         elif inl[i]:
             seen[kk] = i
-    return dict(scale="linear", inl=inl, spacing=float(abs(b)), n_in=int(inl.sum()))
+    return dict(scale="linear", inl=inl, spacing=float(abs(b)), n_in=int(inl.sum()),
+                major=np.zeros(len(pos), bool))
 
 
 def _fit_log(pos: np.ndarray, tol: float = 0.025) -> Optional[dict]:
@@ -92,7 +95,15 @@ def _fit_log(pos: np.ndarray, tol: float = 0.025) -> Optional[dict]:
             inl = dd < tol
             sc = int(inl.sum())
             if best is None or sc > best["n_in"]:
-                best = dict(scale="log", inl=inl, spacing=float(W), n_in=sc)
+                best = dict(scale="log", inl=inl, spacing=float(W), n_in=sc,
+                            W=float(W), phi=float(phi))
+    # Tag each line: a decade line (×10^k) sits at fraction 0/1; the minor lines
+    # 2..9 sit further in.  Distinguishing them lets each class carry its own
+    # consistent width (decade lines are drawn heavier than minor lines).
+    frac = ((pos - pos[0]) / best["W"] + best["phi"]) % 1.0
+    dec = np.minimum(frac, 1.0 - frac)
+    minor = np.min(np.abs(frac[:, None] - _LOG_MANT_MINOR[None, :]), axis=1)
+    best["major"] = best["inl"] & (dec <= minor)
     return best
 
 
@@ -109,8 +120,9 @@ def fit_axis(centers: list[float]) -> dict:
     pos = np.asarray(sorted(centers), float)
     if len(pos) < 4:
         lin = _fit_linear(pos)
-        return {**(lin or {"scale": "linear", "spacing": None}),
-                "pos": pos, "keep": np.ones(len(pos), bool)}
+        base = lin or {"scale": "linear", "spacing": None,
+                       "major": np.zeros(len(pos), bool)}
+        return {**base, "pos": pos, "keep": np.ones(len(pos), bool)}
     diffs = np.diff(pos)
     d = np.median(diffs)
     regular = float(np.mean((diffs > 0.6 * d) & (diffs < 1.4 * d)))
@@ -141,6 +153,73 @@ def _group_runs(cov: np.ndarray, min_cov: float, merge_gap: int) -> list[tuple[i
             start = prev = i
     runs.append((start, prev))
     return runs
+
+
+def _measure_line(darkness: np.ndarray, lo: int, hi: int, pad: int, axis: str):
+    """Robust (center, peak, effective-width) of one line from its soft profile.
+
+    The profile is the per-column (vertical) / per-row (horizontal) MEDIAN
+    darkness over the line's span; for a vertical line it ignores crossing curves
+    (a minority of rows).  ``width_eff = Σ profile / peak`` is the line's true
+    soft width in px (core 1 + two ~0.5 aliased edges ≈ 2).
+    """
+    if axis == "v":
+        a, b = max(0, lo - pad), min(darkness.shape[1], hi + pad + 1)
+        p = np.median(darkness[:, a:b], axis=0)
+    else:
+        a, b = max(0, lo - pad), min(darkness.shape[0], hi + pad + 1)
+        p = np.median(darkness[a:b, :], axis=1)
+    tot = float(p.sum())
+    peak = float(p.max()) if p.size else 0.0
+    if tot <= 1e-6 or peak <= 1e-6:
+        return None
+    xs = np.arange(a, b)
+    center = float((xs * p).sum() / tot)
+    return center, peak, tot / peak
+
+
+def _stamp_line(grid_gray: np.ndarray, center: float, width: float,
+                amp: float, axis: str) -> None:
+    """Draw one line at a CONSISTENT width, sub-pixel centered.
+
+    Coverage at integer pixel ``x`` is ``clip((width/2 + 0.5) - |x - center|, 0, 1)``
+    — for width 2 on an integer center that is a full centre pixel and a 50 %
+    pixel each side (= 2 px), exactly the intended soft profile, and it shifts
+    smoothly for a sub-pixel center.  The same width is used for every line of a
+    class, so an arrow lying on a line can no longer inflate it.
+    """
+    half = width / 2.0 + 0.5
+    limit = grid_gray.shape[1] if axis == "v" else grid_gray.shape[0]
+    lo = max(0, int(math.floor(center - half)))
+    hi = min(limit - 1, int(math.ceil(center + half)))
+    if hi < lo:
+        return
+    idx = np.arange(lo, hi + 1)
+    cov = np.clip(half - np.abs(idx - center), 0.0, 1.0) * amp
+    if axis == "v":
+        grid_gray[:, idx] = np.maximum(grid_gray[:, idx], cov[None, :])
+    else:
+        grid_gray[idx, :] = np.maximum(grid_gray[idx, :], cov[:, None])
+
+
+def _render_axis(grid_gray: np.ndarray, darkness: np.ndarray, pad: int,
+                 kept: list[tuple[int, int]], majors: list[bool], axis: str) -> None:
+    """Render all lines of one axis at a consistent per-class (decade/minor) width."""
+    meas = []
+    for (lo, hi), mj in zip(kept, majors):
+        m = _measure_line(darkness, lo, hi, pad, axis)
+        if m is not None:
+            meas.append((m[0], m[1], m[2], bool(mj)))
+    if not meas:
+        return
+    minw = [wd for _, _, wd, mj in meas if not mj]
+    majw = [wd for _, _, wd, mj in meas if mj]
+    w_minor = float(np.median(minw)) if minw else (float(np.median(majw)) if majw else 2.0)
+    w_major = float(np.median(majw)) if majw else w_minor
+    w_minor = float(np.clip(w_minor, 1.0, 8.0))
+    w_major = float(np.clip(w_major, 1.0, 8.0))
+    for center, peak, _wd, mj in meas:
+        _stamp_line(grid_gray, center, w_major if mj else w_minor, peak, axis)
 
 
 def model_grid(
@@ -182,16 +261,18 @@ def model_grid(
     h_order = np.argsort([(lo + hi) / 2 for lo, hi in h_lines])
     v_keep = [v_lines[v_order[i]] for i in range(len(v_lines)) if fx["keep"][i]]
     h_keep = [h_lines[h_order[i]] for i in range(len(h_lines)) if fy["keep"][i]]
+    # decade/minor class per kept line (aligned to the sorted keep order)
+    vmaj_all = fx.get("major", np.zeros(len(v_lines), bool))
+    hmaj_all = fy.get("major", np.zeros(len(h_lines), bool))
+    v_major = [bool(vmaj_all[i]) for i in range(len(v_lines)) if fx["keep"][i]]
+    h_major = [bool(hmaj_all[i]) for i in range(len(h_lines)) if fy["keep"][i]]
 
+    # Render every line at a CONSISTENT width per class (decade vs minor): the
+    # width is the class median, so a line an arrow happens to lie on is drawn at
+    # the same 2 px as its peers instead of the inflated local ink width.
     grid_gray = np.zeros((h, w), dtype=np.float32)
-    for lo, hi in v_keep:
-        a, b = max(0, lo - edge_pad), min(w, hi + edge_pad + 1)
-        med = np.median(darkness[:, a:b], axis=0)          # per-column profile
-        grid_gray[:, a:b] = np.maximum(grid_gray[:, a:b], med[None, :])
-    for lo, hi in h_keep:
-        a, b = max(0, lo - edge_pad), min(h, hi + edge_pad + 1)
-        med = np.median(darkness[a:b, :], axis=1)          # per-row profile
-        grid_gray[a:b, :] = np.maximum(grid_gray[a:b, :], med[:, None])
+    _render_axis(grid_gray, darkness, edge_pad, v_keep, v_major, "v")
+    _render_axis(grid_gray, darkness, edge_pad, h_keep, h_major, "h")
 
     residual = darkness - grid_gray
     grid_mask = ink & (grid_gray > on_grid) & (residual < resid_tol)
