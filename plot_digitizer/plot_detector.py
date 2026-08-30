@@ -28,8 +28,13 @@ def detect_plot_area(img_array: np.ndarray) -> tuple[int, int, int, int]:
         v_cols = np.where(col_max_run > h * 0.30)[0]
 
         if len(h_rows) >= 2 and len(v_cols) >= 2:
-            y_min, y_max = int(h_rows[0]), int(h_rows[-1])
-            x_min, x_max = int(v_cols[0]), int(v_cols[-1])
+            # h_rows[0] / v_cols[0] are the first (inclusive) spine rows/cols; the
+            # LAST spine index is the OUTER edge of the border, which the caller
+            # crops as [min:max] (max exclusive).  Add 1 so that outer border pixel
+            # is kept — otherwise a 2 px frame (e.g. CMZ bottom/right) loses one px
+            # and the outward ticks past it are cut off.
+            y_min, y_max = int(h_rows[0]), min(h, int(h_rows[-1]) + 1)
+            x_min, x_max = int(v_cols[0]), min(w, int(v_cols[-1]) + 1)
             logger.info(
                 f"Detected plot area (threshold={threshold}): "
                 f"x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
