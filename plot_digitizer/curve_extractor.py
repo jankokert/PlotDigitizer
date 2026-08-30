@@ -77,6 +77,11 @@ def extract_curves(
             # Arc-length tracing may split one mask into several curves
             # (e.g. same-colour curves that cross) — emit each as its own label.
             paths = _extract_trace(mask, x_min, y_min)
+            # Order the curves left-to-right (seg00 = leftmost) by their median x,
+            # so the segment index matches the on-plot order and the legend.
+            paths = [paths[i] for i in _reading_order(
+                np.array([[np.median(p[:, 0]), np.median(p[:, 1])] for p in paths]),
+                force_x=True)]
             for k, pts in enumerate(paths):
                 lbl = label if len(paths) == 1 else f"{label}_seg{k:02d}"
                 curves[lbl] = pts
@@ -123,6 +128,21 @@ def _measure_stroke_width(mask: np.ndarray) -> Optional[float]:
 
 def _fmt_w(x: Optional[float]) -> str:
     return "?" if x is None else f"{x:.1f}"
+
+
+def _reading_order(reps: np.ndarray, force_x: bool = False) -> list[int]:
+    """Indices that read a set of items in natural order from their (x, y) reps.
+
+    Left-to-right when the items are spread more horizontally than vertically;
+    top-to-bottom when they are stacked (a legend column).  ``force_x`` always
+    orders left-to-right (used for plot curves, which fan out horizontally).
+    """
+    reps = np.asarray(reps, dtype=float)
+    if len(reps) <= 1:
+        return list(range(len(reps)))
+    horizontal = force_x or (np.ptp(reps[:, 0]) >= np.ptp(reps[:, 1]))
+    key = reps[:, 0] if horizontal else reps[:, 1]
+    return list(np.argsort(key, kind="stable"))
 
 
 def _segment_by_color(
@@ -239,6 +259,14 @@ def _segment_by_color(
         for gbox, gtext in detect_grid_boxes(canvas, span_frac=span_frac):
             tboxes.append(gbox)
             label_texts.append(gtext)
+        # Order the labels in natural reading order: left-to-right for scattered
+        # callouts (CMZ), top-to-bottom when they form a vertical stack (a USFF
+        # legend).  Keeps text order aligned with the left-to-right curve order.
+        if tboxes:
+            order = _reading_order(
+                np.array([[(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] for b in tboxes]))
+            tboxes = [tboxes[i] for i in order]
+            label_texts = [label_texts[i] for i in order]
         debug["text_boxes"] = tboxes
         debug["legend_boxes"] = legends
         debug["label_texts"] = label_texts
