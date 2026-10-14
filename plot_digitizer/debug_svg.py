@@ -32,6 +32,35 @@ def _xml_escape(text: str) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def write_residual_png(
+    image_path: Path,
+    out_path: Path,
+    plot_area: tuple[int, int, int, int],
+    residual: np.ndarray,
+    curves: dict,
+) -> None:
+    """Faded original + traced curves (cyan) + residual ink (magenta).
+
+    Magenta marks curve ink that no extracted curve explains — where a trace
+    left its tube, cut a corner, or a curve was missed.
+    """
+    import cv2
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        base = np.array(im.convert("RGB")).astype(np.float32)
+    out = (255 - 0.35 * (255 - base)).astype(np.uint8)
+    for pts in curves.values():
+        q = np.rint(np.asarray(pts, dtype=float) * 4).astype(np.int32)
+        if len(q) >= 2:
+            cv2.polylines(out, [q], False, (0, 170, 220), thickness=2,
+                          lineType=cv2.LINE_AA, shift=2)
+    ys, xs = np.where(residual)
+    out[ys + plot_area[1], xs + plot_area[0]] = (230, 0, 160)
+    Image.fromarray(out).save(out_path)
+    logger.info(f"Residual debug PNG written to: {out_path}")
+
+
 def write_grid_debug_png(
     image_path: Path,
     out_path: Path,

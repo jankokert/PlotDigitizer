@@ -55,14 +55,7 @@ def extract_curves(
     x_min, y_min, x_max, y_max = plot_area
     canvas = img_array[y_min:y_max, x_min:x_max].astype(np.float32)
 
-    canvas_labels = None
-    if text_labels is not None:
-        canvas_labels = []
-        for lab in text_labels:
-            bx0, by0, bx1, by1 = lab["box"]
-            if x_min <= (bx0 + bx1) / 2 < x_max and y_min <= (by0 + by1) / 2 < y_max:
-                canvas_labels.append({"text": lab["text"], "conf": 100,
-                                      "box": (bx0 - x_min, by0 - y_min, bx1 - x_min, by1 - y_min)})
+    canvas_labels = labels_in_canvas(text_labels, plot_area) if text_labels is not None else None
 
     color_masks = _segment_by_color(
         canvas,
@@ -101,8 +94,30 @@ def extract_curves(
         if method == "trace":
             # Arc-length tracing may split one mask into several curves
             # (e.g. same-colour curves that cross) — emit each as its own label.
-            paths = _extract_trace(mask, x_min, y_min, walkable)
+            # Slivers much thinner than the pen (grid-subtraction residue,
+            # thin arrow shafts) would lead the march sideways: trace without
+            # them, but keep straight thin pieces as arrow-shaft candidates.
+            pen = _pen_width(mask)
+            body, thin = _split_thin(mask, pen)
+            paths = _extract_trace(body, x_min, y_min, walkable)
+            paths = _extend_ends_to_frame(paths, mask, walkable, pen, (x_min, y_min))
+            # Jointly re-place the traces so their strokes explain the ink:
+            # resolves bands where several curves merge (see curve_refine).
+            from .curve_refine import refine_bundle
+            origin = np.array([x_min, y_min], dtype=float)
+            refined = refine_bundle([pth - origin for pth in paths], mask, walkable)
+            paths = [_adaptive_resample(q + origin, mask.shape[1] / _TARGET_DENSITY)
+                     for q in refined]
             paths = [_trim_border_walk(pth, plot_area) for pth in paths]
+            if annot is not None:
+                # Arrow shafts, followed over the original ink with the traced
+                # curve strokes taken out (so crossings don't stop them).
+                origin = np.array([x_min, y_min], dtype=float)
+                strokes = _stroke_mask(mask.shape, [q - origin for q in paths], pen)
+                frags = annot.setdefault("fragments", {})
+                for seg in _line_fragments(thin, pen):
+                    seg = _follow_arrow(seg, walkable, strokes, pen)
+                    frags[f"shaft_r{len(frags):02d}"] = seg + origin
             # Order the curves left-to-right (seg00 = leftmost) by their median x,
             # so the segment index matches the on-plot order and the legend.
             paths = [paths[i] for i in _reading_order(
@@ -126,7 +141,63 @@ def extract_curves(
             curves[label] = pts
             logger.info(f"  {label}: {len(pts)} points")
 
+    if color_masks:
+        union = np.zeros(canvas.shape[:2], dtype=bool)
+        for m in color_masks.values():
+            union |= m
+        boxes = (annot or {}).get("labels") or []
+        res_mask, res_frac = residual_ink(union, curves, (x_min, y_min),
+                                          [lab["box"] for lab in boxes])
+        logger.info(f"Residual ink (not explained by any curve): "
+                    f"{int(res_mask.sum())} px = {100 * res_frac:.2f} %")
+        if annot is not None:
+            annot["residual_fraction"] = res_frac
+        if debug is not None:
+            debug["residual_mask"] = res_mask
+
     return curves
+
+
+def labels_in_canvas(text_labels: list[dict], plot_area) -> list[dict]:
+    """Text lines (image coords) whose centre lies on the canvas, in canvas coords."""
+    x_min, y_min, x_max, y_max = plot_area
+    out = []
+    for lab in text_labels:
+        bx0, by0, bx1, by1 = lab["box"]
+        if x_min <= (bx0 + bx1) / 2 < x_max and y_min <= (by0 + by1) / 2 < y_max:
+            out.append({"text": lab["text"], "conf": 100,
+                        "box": (bx0 - x_min, by0 - y_min, bx1 - x_min, by1 - y_min)})
+    return out
+
+
+def residual_ink(mask: np.ndarray, curves: dict, offset, exclude_boxes=(),
+                 width: Optional[float] = None) -> tuple[np.ndarray, float]:
+    """Curve ink that no traced curve accounts for.
+
+    Every curve is drawn back as a stroke of the pen width; what is left of
+    the curve mask (outside text boxes) is ink the extraction did not explain:
+    a missed curve, a trace cutting a corner, or a curve pulled off its tube
+    where several curves merge.  Returns (residual mask, fraction of the curve
+    ink).  A good extraction leaves ~0.
+
+    The pen width is measured ON the traces (2 × distance-to-edge at the
+    centre-line), not over the whole mask, whose grid-subtraction slivers would
+    bias it low.  Those slivers (thinner than ~40 % of the pen) are opened
+    away from the residual: it reports missing *tube*, not anti-aliasing dust.
+    """
+    from scipy import ndimage
+    from .curve_refine import stroke_width
+    ox, oy = offset
+    polys = [np.asarray(p, dtype=float) - (ox, oy) for p in curves.values() if len(p) >= 2]
+    if width is None:
+        width = stroke_width(mask, polys) or _measure_stroke_width(mask) or 3.0
+    res = mask & ~_stroke_mask(mask.shape, polys, width)
+    for x0, y0, x1, y1 in exclude_boxes:
+        res[max(0, int(y0)):int(y1) + 1, max(0, int(x0)):int(x1) + 1] = False
+    r = max(1, int(round(0.2 * width)))
+    res = ndimage.binary_opening(res, structure=np.ones((2 * r + 1, 2 * r + 1), bool))
+    total = int(mask.sum())
+    return res, (float(res.sum()) / total if total else 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +864,7 @@ def _extract_trace(
     """
     Follow each curve along its arc length (not column-by-column).
 
+
     The plotted trace is a thick "tube" (many overlapping pen dots).  We ridge-
     follow it: each step advances a fixed distance along the local heading, then
     re-centres *perpendicular* to the heading using the median of the local
@@ -913,6 +985,162 @@ def _extract_trace(
 
     paths.sort(key=len, reverse=True)
     return paths
+
+
+def _extend_ends_to_frame(paths: list[np.ndarray], mask: np.ndarray,
+                          walkable: np.ndarray, pen: float, origin) -> list[np.ndarray]:
+    """Re-grow curve ends near the frame on the full (un-thinned) mask.
+
+    Along the frame the curve ink is thinned by the frame/grid removal, so
+    sliver cleaning can clip the last few pixels of a curve that starts on an
+    axis (BAT46GW: the steep rise at V = 0).  Ends deeper inside the plot are
+    left alone: there a thin continuation is an arrow shaft, not curve.
+    """
+    from scipy.spatial import cKDTree
+    if not paths or mask.sum() < 8:
+        return paths
+    h, w = mask.shape
+    coords = np.argwhere(mask)[:, ::-1].astype(float)
+    tree = cKDTree(coords)
+    step = max(1.5, 0.3 * pen)
+    reach = 3.0 * pen
+    out = []
+    for path in paths:
+        q = np.asarray(path, dtype=float) - origin
+        for front in (True, False):
+            end = q[0] if front else q[-1]
+            if min(end[0], end[1], w - 1 - end[0], h - 1 - end[1]) > reach or len(q) < 3:
+                continue
+            prev = q[min(2, len(q) - 1)] if front else q[max(-3, -len(q))]
+            d = end - prev
+            nd = float(np.hypot(*d))
+            if nd < 1e-6:
+                continue
+            # Straight on only: never turn onto the frame line itself.
+            ext = _march(tree, coords, end, d / nd, step, 0.8 * pen + step, pen, pen,
+                         max_steps=int(reach / step) + 1, trav=walkable,
+                         min_cos=float(np.cos(np.radians(35))))
+            if ext:
+                ext = np.array(ext)
+                q = np.vstack([ext[::-1], q]) if front else np.vstack([q, ext])
+        out.append(q + origin)
+    return out
+
+
+def _split_thin(mask: np.ndarray, pen: float) -> tuple[np.ndarray, np.ndarray]:
+    """(mask opened by ~40 % of the pen, the thin remainder)."""
+    from scipy import ndimage
+    r = int(0.2 * pen)
+    if r < 1:
+        return mask, np.zeros_like(mask)
+    body = ndimage.binary_opening(mask, structure=np.ones((2 * r + 1, 2 * r + 1), bool))
+    if body.sum() < 8:
+        return mask, np.zeros_like(mask)
+    return body, mask & ~body
+
+
+def _line_fragments(thin: np.ndarray, pen: float) -> list[np.ndarray]:
+    """Straight, thin, oblique components of `thin` as [end, end] segments.
+
+    These are callout-arrow shafts (thinner than the curves by the width
+    hierarchy).  Axis-parallel pieces are grid residue and skipped.
+    """
+    from scipy import ndimage
+    lab, n = ndimage.label(thin, structure=np.ones((3, 3), bool))
+    out = []
+    min_len = max(10.0, 4.0 * pen)
+    for sl, i in zip(ndimage.find_objects(lab), range(1, n + 1)):
+        if sl is None:
+            continue
+        ys, xs = np.nonzero(lab[sl] == i)
+        if len(xs) < min_len:
+            continue
+        pts = np.column_stack([xs + sl[1].start, ys + sl[0].start]).astype(float)
+        c = pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+        ax = vt[0]
+        t = (pts - c) @ ax
+        perp = (pts - c) @ vt[1]
+        length = float(t.max() - t.min())
+        if length < min_len or np.ptp(perp) > max(3.0, 0.6 * pen):
+            continue
+        ang = abs(np.degrees(np.arctan2(ax[1], ax[0]))) % 90
+        if ang < 4 or ang > 86:                   # axis-parallel: grid residue
+            continue
+        out.append(np.vstack([c + t.min() * ax, c + t.max() * ax]))
+    return out
+
+
+def _stroke_mask(shape, paths: list[np.ndarray], pen: float) -> np.ndarray:
+    """The traced curves drawn back as strokes of the pen width (+1 px a side)."""
+    import cv2
+    m = np.zeros(shape, dtype=np.uint8)
+    thick = max(1, int(round(pen + 2)))
+    for q in paths:
+        if len(q) >= 2:
+            cv2.polylines(m, [np.rint(np.asarray(q) * 4).astype(np.int32)], False, 1,
+                          thickness=thick, lineType=cv2.LINE_8, shift=2)
+    return m.astype(bool)
+
+
+def _follow_arrow(seg: np.ndarray, ink: np.ndarray, strokes: np.ndarray,
+                  pen: float) -> np.ndarray:
+    """Prolong a straight shaft piece along its line to the arrow's real ends.
+
+    The thin-component piece of a callout arrow stops where the arrow crosses
+    a curve.  Walking along the line over the ORIGINAL ink, curve-stroke
+    pixels (`strokes`) are passed over at any crossing angle, and the walk
+    ends at real white.  Each end is the last ANNOTATION pixel (ink that is
+    no curve) — so the far end is the arrowhead's tip even when the arrow
+    runs on into a band of merged curves; curves it merely crossed lie behind
+    the tip.
+    """
+    h, w = ink.shape
+    a, b = np.asarray(seg[0], float), np.asarray(seg[1], float)
+    u = b - a
+    n = float(np.hypot(*u))
+    if n < 1e-6:
+        return seg
+    u /= n
+    gap_max = max(3, int(0.3 * pen))
+    limit = int(0.5 * max(h, w))
+
+    def walk(p, d):
+        last, gap = p, 0
+        for k in range(1, limit):
+            q = p + k * d
+            x, y = int(round(q[0])), int(round(q[1]))
+            if not (0 <= x < w and 0 <= y < h):
+                break
+            if strokes[y, x]:
+                continue                       # a curve: pass over it
+            if ink[y, x]:
+                last, gap = q, 0               # annotation ink
+            else:
+                gap += 1
+                if gap > gap_max:
+                    break
+        return last
+
+    return np.vstack([walk(a, -u), walk(b, u)])
+
+
+def _pen_width(mask: np.ndarray) -> float:
+    """Pen stroke width of the curves in `mask`, robust to slivers and text.
+
+    Each ink pixel gets the local stroke thickness (2 × the largest distance-
+    to-edge in its neighbourhood, i.e. of the medial ball covering it); the
+    median over all pixels is area-weighted, so the long thick curves dominate
+    the grid-subtraction slivers and glyphs that bias a plain median low.
+    """
+    from scipy import ndimage
+    dist = ndimage.distance_transform_edt(mask)
+    vals = dist[mask]
+    if len(vals) == 0:
+        return 2.0
+    k = 2 * int(np.ceil(np.percentile(vals, 99))) + 1
+    local = ndimage.maximum_filter(dist, size=k)[mask]
+    return max(1.0, 2.0 * float(np.median(local)))
 
 
 _TARGET_DENSITY = 100  # base points across the canvas width (curvy regions)
@@ -1045,7 +1273,8 @@ def _los_blocked(trav: np.ndarray, p: np.ndarray, q: np.ndarray) -> bool:
 
 
 def _march(tree, coords, start, direction, step, search_r, cover_r,
-           width, max_steps: int = 6000, trav: Optional[np.ndarray] = None) -> list[np.ndarray]:
+           width, max_steps: int = 6000, trav: Optional[np.ndarray] = None,
+           min_cos: float = -0.3) -> list[np.ndarray]:
     """
     Walk from `start` along `direction`, one `step` at a time, returning the
     ordered centre-line points (excluding the start point).
@@ -1101,7 +1330,6 @@ def _march(tree, coords, start, direction, step, search_r, cover_r,
         # all forward pixels at a genuine sharp bend.
         straight = cos_a > STRAIGHT
         chosen = idxs_a[straight] if straight.any() else idxs_a
-
         pts_chosen = coords[chosen]
         c = pts_chosen.sum(axis=0) / len(pts_chosen)   # == mean(axis=0), cheaper
 
@@ -1132,7 +1360,7 @@ def _march(tree, coords, start, direction, step, search_r, cover_r,
         # triangles seen at the bottom of the steep CMZ curves).  A real data curve
         # is monotone and never reverses past its start heading, so a step that
         # points opposite d_init is that fold — stop instead of doubling back.
-        if newd[0] * d_init[0] + newd[1] * d_init[1] < -0.3:
+        if newd[0] * d_init[0] + newd[1] * d_init[1] < min_cos:
             break
         d = 0.6 * d + 0.4 * newd
         d /= math.hypot(d[0], d[1]) + 1e-12

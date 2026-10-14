@@ -181,6 +181,28 @@ are ignored. The plot is the cluster of vector drawings / images directly
 above (or below) the caption, grown by nearby text. Scanned PDFs without a
 text layer are not supported yet.
 
+#### Two modes: vector (exact) and raster (fallback)
+
+Most datasheet plots are vector art. The JSON sidecar also stores the
+figure's vector paths, and `--mode auto` (the default) then takes the curves
+**exactly from the PDF paths**: stroked open paths become curves, a straight
+stroke with a filled arrowhead becomes a callout arrow, and grid, ticks and
+frame are ignored. Curves are resampled to about 100 points per plot width,
+so linear interpolation of the CSV is also correct on log axes. Unlabelled
+small sketches inside a labelled family (e.g. a duty-cycle pulse symbol) are
+dropped. Scanned or bitmap figures fall back to **raster tracing**.
+`--mode vector` / `--mode raster` force a mode.
+
+Raster tracing in brief:
+- Slivers thinner than ~40 % of the pen (grid-subtraction residue, thin
+  arrow shafts) are removed before tracing.
+- Curve ends close to the frame are regrown on the full mask.
+- A joint *bundle refinement* places all curves together. Where several
+  curves merge into one band, their strokes must cover the band edge to
+  edge, in the stacking order seen where they are still separate.
+- Arrow shafts are followed over the original ink, minus the traced curve
+  strokes, to the arrowhead tip.
+
 The JSON also holds the PDF text lines inside the crop (in PNG pixels, with
 subscripts as `T_A`). When digitizing `<name>.png`, a sibling `<name>.json`
 replaces OCR for the in-plot labels. Curve families such as `T_A = 25 °C`,
@@ -199,6 +221,7 @@ dropped from the data), or by vertical order when there are no arrows.
 | `<stem>_debug_grid.png` | Pixel-exact overlay of the **reconstructed grid** (red), arrows (blue) and text boxes (green) |
 | `<stem>_debug_grid.json` | The fitted grid model — axis type, spacing, phase, minor/major widths |
 | `<stem>_debug_arrows.json` | The fitted arrow model and the measured stroke widths (`widths_px`) |
+| `<stem>_debug_residual.png` | Raster mode: traced curves (cyan) and curve ink no curve explains (magenta) |
 
 Pass an optional path (`--debug-files out/run1.svg`) to name the SVG; the siblings follow its stem.
 
@@ -316,12 +339,23 @@ sparse-column curves).
 ```
 
 Runs all real test plots in parallel and compares them with
-`tests/regression/baseline/*.json`. It checks the canvas, the axis
-calibration, the CSV header, the curve names and the curve geometry (mean
-and max pixel distance: `same` < 0.5 px, `close` < 3 px, otherwise
-`CHANGED`). Run it before and after every algorithm change. The current
-run's artefacts (CSV, debug SVG/PNG/JSON, log) go to
-`tests/regression/current/<case>/`.
+`tests/regression/baseline/*.json`. It checks:
+- the canvas and the axis calibration,
+- the CSV header and the curve names,
+- the curve geometry, with curves matched by shape (mean and max pixel
+  distance: `same` < 0.5 px, `close` < 3 px, otherwise `CHANGED`).
+
+Quality metrics:
+- **Residual ink**: curve pixels that no extracted curve explains.
+- **Ground-truth error** for PDF figures: the raster result against the exact
+  vector curves, as mean, p95 and coverage. The *resolvable* figures cover
+  only stretches where neighbouring curves are more than one stroke apart.
+- **Label check**: raster names against the vector twin.
+
+Run it before and after every algorithm change. `--compare-only`
+re-compares the last run without running the pipeline again. The current
+run's artefacts go to `tests/regression/current/<case>/`: CSV, debug
+SVG/PNG/JSON, `_debug_residual.png` (magenta = unexplained ink) and the log.
 
 ---
 

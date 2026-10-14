@@ -52,6 +52,10 @@ class FigureInfo:
     # subscripts are marked with "_" ("T_A = 25 °C").  Lets the digitizer use
     # exact labels instead of OCR.
     text: list[dict] | None = None
+    # Vector paths inside the crop (PNG pixel coords), one entry per sub-path:
+    # {stroke, fill, closed, width (px), color, points}.  Present when the
+    # figure is vector art -> exact curve extraction ("vector mode").
+    vectors: list[dict] | None = None
 
 
 @dataclass
@@ -240,6 +244,7 @@ def extract_figure(pdf_path: Path, figure: str, out_dir: Path | None = None,
 
         page.get_pixmap(clip=clip, dpi=dpi, alpha=False).save(png_path)
         text = _text_lines(page, clip, dpi)
+        vectors = _vector_paths(page, clip, dpi)
 
         with pymupdf.open() as crop:
             p = crop.new_page(width=clip.width, height=clip.height)
@@ -252,8 +257,93 @@ def extract_figure(pdf_path: Path, figure: str, out_dir: Path | None = None,
     info = FigureInfo(source_pdf=pdf_path.name, figure=cap.number, page=cap.page + 1,
                       caption=cap.text, title=cap.title,
                       clip=tuple(round(v, 2) for v in clip), dpi=dpi,
-                      png=png_path.name, pdf=pdf_out.name, text=text)
+                      png=png_path.name, pdf=pdf_out.name, text=text,
+                      vectors=vectors or None)
     (out_dir / f"{stem}.json").write_text(json.dumps(asdict(info), indent=2,
                                                      ensure_ascii=False), encoding="utf-8")
     logger.info(f"Figure {cap.number} (page {cap.page + 1}) -> {png_path}")
     return info
+
+
+def _vector_paths(page: pymupdf.Page, clip: pymupdf.Rect, dpi: int) -> list[dict]:
+    """All line/Bézier sub-paths of *page* touching *clip*, in PNG pixels.
+
+    Rectangles ('re') and quads are skipped (frame, white label boxes); cubic
+    Béziers are sampled.  Each sub-path keeps its paint: stroke/fill, width
+    (px), colour, closed flag.
+    """
+    k = dpi / 72.0
+    out = []
+    for dr in page.get_drawings():
+        if not dr["rect"].intersects(clip):
+            continue
+        if any(it[0] not in ("l", "c") for it in dr["items"]):
+            continue
+        subpaths: list[list] = []
+        for it in dr["items"]:
+            start = it[1]
+            if not subpaths or subpaths[-1][-1] != start:
+                subpaths.append([start])
+            if it[0] == "l":
+                subpaths[-1].append(it[2])
+            else:                                       # cubic Bézier: sample
+                p0, p1, p2, p3 = it[1:5]
+                for t in (0.25, 0.5, 0.75, 1.0):
+                    u = 1 - t
+                    subpaths[-1].append(p0 * u ** 3 + p1 * 3 * u * u * t
+                                        + p2 * 3 * u * t * t + p3 * t ** 3)
+        typ = dr["type"] or ""
+        color = dr.get("color") if "s" in typ else dr.get("fill")
+        for sp in subpaths:
+            pts = [[round((pt.x - clip.x0) * k, 2), round((pt.y - clip.y0) * k, 2)] for pt in sp]
+            out.append({"stroke": "s" in typ, "fill": "f" in typ,
+                        "closed": bool(dr.get("closePath")) or sp[0] == sp[-1],
+                        "width": round(float(dr.get("width") or 0) * k, 3),
+                        "color": [round(c, 3) for c in color] if color else None,
+                        "points": pts})
+    return out
+
+
+def vector_polylines(pdf_path: Path, page_no: int, clip: tuple, dpi: int,
+                     min_extent: float = 0.15) -> list[dict]:
+    """Stroked open vector paths inside *clip* as polylines in PNG pixel coords.
+
+    Returns ``[{width_pt, points}]`` for paths whose extent is at least
+    *min_extent* of the clip (ticks and short arrow shafts are skipped).  A
+    path that runs out and back (two curves drawn as one stroke, like the
+    175 °C curve of MUH1PB Fig. 3) is split at its x turning point.  Datasheet
+    curves in vector PDFs come out exactly — used as ground truth for the
+    raster tracer.
+    """
+    clip = pymupdf.Rect(clip)
+    k = dpi / 72.0
+    lim = min_extent * min(clip.width, clip.height) * k
+    out = []
+    with pymupdf.open(pdf_path) as doc:
+        for vp in _vector_paths(doc[page_no - 1], clip, dpi):
+            if not vp["stroke"] or vp["closed"]:
+                continue
+            for piece in _split_at_x_turn([tuple(p) for p in vp["points"]]):
+                xs = [p[0] for p in piece]
+                ys = [p[1] for p in piece]
+                if max(max(xs) - min(xs), max(ys) - min(ys)) < lim:
+                    continue
+                out.append({"width_pt": round(vp["width"] / k, 3),
+                            "points": [list(p) for p in piece]})
+    return out
+
+
+def _split_at_x_turn(pts: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    """Split a polyline where its x direction reverses (out-and-back stroke)."""
+    pieces, cur, sign = [], [pts[0]], 0
+    for a, b in zip(pts[:-1], pts[1:]):
+        dx = b[0] - a[0]
+        s = (dx > 1e-6) - (dx < -1e-6)
+        if s and sign and s != sign:
+            pieces.append(cur)
+            cur = [a]
+        if s:
+            sign = s
+        cur.append(b)
+    pieces.append(cur)
+    return [p for p in pieces if len(p) >= 2]

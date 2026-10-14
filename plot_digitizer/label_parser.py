@@ -85,16 +85,9 @@ def parse_labels(texts: list[str]) -> LabelFamily | None:
     return LabelFamily(symbol=sym, unit=unit, values=values, members=members)
 
 
-def _densify(pts, step: float = 2.0):
-    pts = np.asarray(pts, dtype=float)
-    if len(pts) < 2:
-        return pts
-    out = [pts[:1]]
-    for a, b in zip(pts[:-1], pts[1:]):
-        n = max(1, int(np.hypot(*(b - a)) / step))
-        t = np.linspace(0, 1, n + 1)[1:, None]
-        out.append(a + t * (b - a))
-    return np.vstack(out)
+def _densify(pts, step: float = 2.0) -> np.ndarray:
+    from .curve_refine import densify
+    return densify(pts, step)
 
 
 def _arc_length(pts) -> float:
@@ -108,16 +101,6 @@ def _y_at(pts, x: float) -> float:
     return float(np.interp(x, pts[o, 0], pts[o, 1]))
 
 
-def _ray_hit(dense: np.ndarray, tip: tuple[float, float], u: np.ndarray,
-             tol: float) -> float | None:
-    """|Distance| along ray (tip, u) to the nearest point of *dense* within *tol* of it."""
-    rel = dense - np.asarray(tip)
-    t = rel @ u
-    perp = np.abs(rel[:, 0] * u[1] - rel[:, 1] * u[0])
-    ok = (t > -tol) & (perp < tol)
-    return float(np.abs(t[ok]).min()) if ok.any() else None
-
-
 def _box_dist(b: np.ndarray, pts: np.ndarray) -> np.ndarray:
     dx = np.maximum(0, np.maximum(b[0] - pts[:, 0], pts[:, 0] - b[2]))
     dy = np.maximum(0, np.maximum(b[1] - pts[:, 1], pts[:, 1] - b[3]))
@@ -125,7 +108,8 @@ def _box_dist(b: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
-                  plot_area: tuple[int, int, int, int]
+                  plot_area: tuple[int, int, int, int],
+                  extra_fragments: dict | None = None,
                   ) -> tuple[dict[str, str], str, list[str]]:
     """Map curve names to label values.
 
@@ -133,19 +117,23 @@ def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
     labels:    [{text, box}] in canvas pixels
     arrows:    detect_arrows() output (``label``, ``tip_x``, ``tip_y``, canvas px)
     plot_area: canvas (x0, y0, x1, y1) in the image
+    extra_fragments: arrow candidates {name: [end, ..., end]} in image pixels
+               (vector shafts, or raster shafts followed to their tip)
 
-    Returns ({curve_name: value}, column header, arrow-shaft curve names).
+    Returns ({curve_name: value}, column header, names of the fragments used
+    as arrows — the caller drops those that are traced curves).
 
-    * Short traced fragments are never named.  A fragment with one end at a
-      label box is that label's arrow shaft (the tracer picks shafts up): its
-      direction is followed from the far end to the first curve it hits.  The
-      shafts are returned so the caller can drop them from the data.
-    * Labels without a shaft use a detected arrowhead tip (nearest curve);
-      tips on the canvas border are frame false positives and ignored.
-    * Without any arrows and with as many labels as curves the labels sit
-      next to their curves in the same vertical order: matched by rank (robust
-      whether labels are placed above or below their curve).
-    * Otherwise: Hungarian assignment on the distance label box -> curve.
+    * Arrows: a fragment (short traced curve or extra fragment) with one end
+      at a label box and pointing away from it is that label's arrow; its
+      other end is the tip.  Labels without one fall back to a detected
+      arrowhead (tips on the canvas border are frame false positives).
+    * Labels with an arrow, or a mix: Hungarian assignment on tip -> curve
+      distance (labels without an arrow pay a large offset plus their box
+      distance), so a sloppy arrow touching a neighbour is still resolved
+      globally.
+    * No arrows at all and as many labels as curves: labels sit next to their
+      curves in the same vertical order, matched by rank (robust whether they
+      are placed above or below).
     """
     family = parse_labels([lab["text"] for lab in labels])
     if family is None or not curves:
@@ -155,64 +143,61 @@ def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
     lengths = {n: _arc_length(curves[n]) for n in names}
     longest = max(lengths.values())
     cands = [n for n in names if lengths[n] >= 0.25 * longest]
-    frags = [n for n in names if n not in cands]
+    pool = {n: curves[n] for n in names if n not in cands}
+    pool.update(extra_fragments or {})
     dense = [_densify(curves[n]) for n in cands]
 
     members = family.members
     boxes = [np.array(labels[i]["box"], dtype=float) + (x0, y0, x0, y0) for i in members]
-    # Per label: ("ray", tip, direction) | ("tip", tip) | None
-    pointers: list[tuple | None] = [None] * len(members)
+    tips: list[np.ndarray | None] = [None] * len(members)
 
-    shafts: list[str] = []
+    # Arrow = fragment starting at the label box and pointing AWAY from it
+    # (far end clearly farther from the box); nearest pairs first.
+    used: list[str] = []
+    cand = []
     for k, b in enumerate(boxes):
         reach = 1.5 * (b[3] - b[1])
-        best, best_d = None, reach
-        for n in frags:
-            if n in shafts:
-                continue
-            pts = np.asarray(curves[n], dtype=float)
+        for n, frag in pool.items():
+            pts = np.asarray(frag, dtype=float)
             d = _box_dist(b, pts[[0, -1]])
             j = int(np.argmin(d))
-            if d[j] < best_d:
-                best, best_d = n, d[j]
-                far = pts[-1] if j == 0 else pts[0]
-                mid = pts[len(pts) // 2]
-        if best is not None:
-            u = far - mid
-            u = u / max(np.hypot(*u), 1e-9)
-            shafts.append(best)
-            pointers[k] = ("ray", (float(far[0]), float(far[1])), u)
+            length = float(np.hypot(*(pts[-1] - pts[0])))
+            if d[j] < reach and d[1 - j] - d[j] >= 0.5 * length:
+                cand.append((float(d[j]), k, n, j))
+    for _, k, n, j in sorted(cand):
+        if tips[k] is not None or n in used:
+            continue
+        pts = np.asarray(pool[n], dtype=float)
+        tips[k] = pts[-1] if j == 0 else pts[0]
+        used.append(n)
 
+    margin = 8
     free_arrows = [a for a in arrows
-                   if 8 < a["tip_x"] + x0 - x0 < (x1 - x0) - 8 and 8 < a["tip_y"] < (y1 - y0) - 8]
+                   if margin < a["tip_x"] < (x1 - x0) - margin
+                   and margin < a["tip_y"] < (y1 - y0) - margin]
     for k, i in enumerate(members):
-        if pointers[k] is not None:
+        if tips[k] is not None:
             continue
         hit = next((a for a in free_arrows if a["label"] == labels[i]["text"]), None)
         if hit is not None:
             free_arrows.remove(hit)
-            pointers[k] = ("tip", (hit["tip_x"] + x0, hit["tip_y"] + y0))
+            tips[k] = np.array([hit["tip_x"] + x0, hit["tip_y"] + y0], dtype=float)
 
-    if all(p is None for p in pointers) and len(members) == len(cands):
+    if all(t is None for t in tips) and len(members) == len(cands):
         xs = [(b[0] + b[2]) / 2 for b in boxes]
         lab_order = np.argsort([(b[1] + b[3]) / 2 for b in boxes])
         cur_order = np.argsort([np.mean([_y_at(curves[n], x) for x in xs]) for n in cands])
         pairs = list(zip(lab_order, cur_order))
     else:
-        tol = 0.25 * float(np.median([b[3] - b[1] for b in boxes]))
         cost = np.zeros((len(members), len(cands)))
-        for r, (ptr, b) in enumerate(zip(pointers, boxes)):
+        for r, (tip, b) in enumerate(zip(tips, boxes)):
             for c, d in enumerate(dense):
-                if ptr is not None:
-                    tip = np.asarray(ptr[1])
-                    near = np.hypot(d[:, 0] - tip[0], d[:, 1] - tip[1]).min()
-                    t = _ray_hit(d, ptr[1], ptr[2], tol) if ptr[0] == "ray" else None
-                    # A ray hit is decisive; otherwise fall back to (penalised) proximity.
-                    cost[r, c] = t if t is not None else 1e3 + near
+                if tip is not None:
+                    cost[r, c] = np.hypot(d[:, 0] - tip[0], d[:, 1] - tip[1]).min()
                 else:
                     cost[r, c] = 1e4 + _box_dist(b, d).min()
         rows, cols = linear_sum_assignment(cost)
         pairs = list(zip(rows, cols))
 
     mapping = {cands[c]: family.values[members[r]] for r, c in pairs}
-    return mapping, family.header, shafts
+    return mapping, family.header, used

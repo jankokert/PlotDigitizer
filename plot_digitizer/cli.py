@@ -61,6 +61,11 @@ def main() -> None:
         help="With --pdf: only export the figure PNG/PDF/JSON, do not digitize",
     )
     parser.add_argument(
+        "--mode", choices=["auto", "vector", "raster"], default="auto",
+        help="Curve source: 'vector' = exact PDF paths from the sidecar JSON "
+             "(--pdf), 'raster' = trace pixels, 'auto' = vector when available",
+    )
+    parser.add_argument(
         "--dpi", type=int, default=600,
         help="Rendering resolution of the PNG exported from --pdf",
     )
@@ -277,6 +282,7 @@ def _digitize(args: argparse.Namespace, image_path: Path, logger: logging.Logger
         target_colors=target_colors,
         color_tolerance=args.color_tolerance,
         debug_svg=debug_svg_path,
+        mode=args.mode,
     )
     logger.info(f"Output written to: {output_path}")
 
