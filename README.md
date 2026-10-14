@@ -52,7 +52,7 @@ alone. This fork treats it as a **reconstruction** problem rather than a colour 
 3. **Trace each curve by arc length**, constrained to originally-inked pixels, so overlapping black
    curves stay separate instead of merging.
 
-Result on the CMZ54xxB Zener datasheet: **10 curves separated cleanly** on a plot with **zero colour
+Result on the CMZ53xxB Zener datasheet: **10 curves separated cleanly** on a plot with **zero colour
 information**.
 
 ---
