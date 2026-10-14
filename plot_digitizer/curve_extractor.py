@@ -26,6 +26,8 @@ def extract_curves(
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
     debug: Optional[dict] = None,
+    text_labels: Optional[list[dict]] = None,
+    annot: Optional[dict] = None,
 ) -> dict[str, np.ndarray]:
     """
     Extract digitised curves from the plot area.
@@ -42,12 +44,25 @@ def extract_curves(
         target_colors:  If given, extract only pixels near these RGB colours
                         instead of automatic hue-bin segmentation.
         color_tolerance: Euclidean RGB distance for target-colour matching.
+        text_labels:    Known text lines ``{text, box}`` in image coords (e.g. from
+                        a PDF text layer); replaces OCR of the in-plot labels.
+        annot:          If given, receives ``labels`` and ``label_arrows``
+                        (canvas coords) for label↔curve assignment.
 
     Returns dict mapping colour label → Nx2 float array of
     (pixel_x, pixel_y) values in image coordinates.
     """
     x_min, y_min, x_max, y_max = plot_area
     canvas = img_array[y_min:y_max, x_min:x_max].astype(np.float32)
+
+    canvas_labels = None
+    if text_labels is not None:
+        canvas_labels = []
+        for lab in text_labels:
+            bx0, by0, bx1, by1 = lab["box"]
+            if x_min <= (bx0 + bx1) / 2 < x_max and y_min <= (by0 + by1) / 2 < y_max:
+                canvas_labels.append({"text": lab["text"], "conf": 100,
+                                      "box": (bx0 - x_min, by0 - y_min, bx1 - x_min, by1 - y_min)})
 
     color_masks = _segment_by_color(
         canvas,
@@ -59,6 +74,8 @@ def extract_curves(
         target_colors=target_colors,
         color_tolerance=color_tolerance,
         debug=debug,
+        text_labels=canvas_labels,
+        annot=annot,
     )
     # Walkable map: every pixel that was originally ink (dark OR coloured) — i.e.
     # curve, grid and arrows before any removal.  The tracer may bridge a gap only
@@ -85,6 +102,7 @@ def extract_curves(
             # Arc-length tracing may split one mask into several curves
             # (e.g. same-colour curves that cross) — emit each as its own label.
             paths = _extract_trace(mask, x_min, y_min, walkable)
+            paths = [_trim_border_walk(pth, plot_area) for pth in paths]
             # Order the curves left-to-right (seg00 = leftmost) by their median x,
             # so the segment index matches the on-plot order and the legend.
             paths = [paths[i] for i in _reading_order(
@@ -138,6 +156,62 @@ def _fmt_w(x: Optional[float]) -> str:
     return "?" if x is None else f"{x:.1f}"
 
 
+def _trim_border_walk(pts: np.ndarray, plot_area, margin: Optional[float] = None) -> np.ndarray:
+    """Cut the stretch where a trace runs along the canvas frame at a curve end.
+
+    A curve leaving the plot through the frame lets the tracer continue along
+    the frame line (it is walkable ink), e.g. along the x axis to the origin.
+    Nothing stops such a walk before the frame CORNER, so only an end in a
+    corner counts: the run of end points hugging that frame side is dropped
+    and replaced by the curve's last interior segment extrapolated to the frame
+    (the true exit point).  A curve that genuinely runs close to an axis
+    (BAT46GW: steep rise along x = 0) does not end in a corner and is kept.
+    """
+    x0, y0, x1, y1 = plot_area
+    x1, y1 = x1 - 1, y1 - 1
+    if margin is None:
+        margin = max(5.0, 0.01 * min(x1 - x0, y1 - y0))
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 4:
+        return pts
+
+    def side(p):
+        d = [p[0] - x0, x1 - p[0], p[1] - y0, y1 - p[1]]
+        k = int(np.argmin(d))
+        return k if d[k] < margin else None
+
+    def in_corner(p):
+        near_x = min(p[0] - x0, x1 - p[0]) < margin
+        near_y = min(p[1] - y0, y1 - p[1]) < margin
+        return near_x and near_y
+
+    def trim_front(q):
+        if not in_corner(q[0]):
+            return q
+        s0 = side(q[0])
+        k = 0
+        while k < len(q) and s0 is not None and side(q[k]) == s0:
+            k += 1
+        if k < 2 or k > len(q) - 2:
+            return q
+        a, b = q[k], q[k + 1]                  # first interior segment, extended back
+        d = a - b
+        border = [x0, x1, y0, y1][s0]
+        axis = 0 if s0 < 2 else 1
+        if abs(d[axis]) < 1e-9:
+            return q[k:]
+        t = (border - a[axis]) / d[axis]
+        if t < 0:
+            return q[k:]
+        exit_pt = a + t * d
+        exit_pt[0] = min(max(exit_pt[0], x0), x1)
+        exit_pt[1] = min(max(exit_pt[1], y0), y1)
+        return np.vstack([exit_pt, q[k:]])
+
+    pts = trim_front(pts)
+    return trim_front(pts[::-1])[::-1]
+
+
 def _reading_order(reps: np.ndarray, force_x: bool = False) -> list[int]:
     """Indices that read a set of items in natural order from their (x, y) reps.
 
@@ -164,6 +238,8 @@ def _segment_by_color(
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
     debug: Optional[dict] = None,
+    text_labels: Optional[list[dict]] = None,
+    annot: Optional[dict] = None,
 ) -> dict[str, np.ndarray]:
     """
     Return {label: bool_mask} for each distinct colour group.
@@ -209,8 +285,12 @@ def _segment_by_color(
         from .annotation_detector import detect_text_labels_ocr, detect_arrows
         from .arrow_model import model_arrows
         _ink0 = (s < 0.30) & (v < 0.90)
-        _ocr_labels = detect_text_labels_ocr(canvas)
+        _ocr_labels = (text_labels if text_labels is not None
+                       else detect_text_labels_ocr(canvas))
         label_arrows = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        if annot is not None:
+            annot["labels"] = _ocr_labels
+            annot["label_arrows"] = label_arrows
         # Parametric arrow model (triangular head + shaft) reconstructed on the
         # pixels, anchored on the confirmed callout heads, and subtracted with an
         # anti-aliased footprint; union with the horizontal on-grid shaft removal
@@ -261,12 +341,19 @@ def _segment_by_color(
         label_texts = [lab["text"] for lab in _ocr_labels]
         # A legend is a genuine vertical stack of aligned labels (USFF 0.05–0.25
         # A); scattered callouts yield none. Grow it to the white-box edges.
-        legends = [expand_to_white(_ink, lg) for lg in detect_legend_boxes(tboxes)]
-        # Arrow-less notes on a white patch (e.g. "f=1.0MHz") are found by the
-        # hole they punch in the grid, and come with their OCR reading already.
-        for gbox, gtext in detect_grid_boxes(canvas, span_frac=span_frac):
-            tboxes.append(gbox)
-            label_texts.append(gtext)
+        legends = [expand_to_white(_ink, lg)
+                   for lg in detect_legend_boxes(tboxes, label_texts)]
+        if text_labels is not None:
+            # PDF text layer: every in-plot text is known exactly; show the
+            # white patch each label sits on.
+            tboxes = [expand_to_white(_ink, tuple(int(v) for v in b), margin=60)
+                      for b in tboxes]
+        else:
+            # Arrow-less notes on a white patch (e.g. "f=1.0MHz") are found by
+            # the hole they punch in the grid, and come with their OCR reading.
+            for gbox, gtext in detect_grid_boxes(canvas, span_frac=span_frac):
+                tboxes.append(gbox)
+                label_texts.append(gtext)
         # Order the labels in natural reading order: left-to-right for scattered
         # callouts (CMZ), top-to-bottom when they form a vertical stack (a USFF
         # legend).  Keeps text order aligned with the left-to-right curve order.

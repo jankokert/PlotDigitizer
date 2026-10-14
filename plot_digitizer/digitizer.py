@@ -1,6 +1,7 @@
 """Main digitisation pipeline."""
 
 import csv
+import json
 import logging
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from PIL import Image
 
 from .axis_reader import pixel_to_data, read_axes
 from .curve_extractor import extract_curves
+from .label_parser import assign_labels
 from .plot_detector import detect_plot_area
 
 logger = logging.getLogger(__name__)
@@ -35,10 +37,13 @@ def digitize_plot(
     target_colors: Optional[list[tuple[int, int, int]]] = None,
     color_tolerance: float = 40.0,
     debug_svg: Optional[Path] = None,
-) -> None:
+) -> dict:
     """
     Full pipeline: load image → detect plot area → read axes → extract curves
     → convert to data coords → write CSV.
+
+    Returns a summary (plot area, calibrations, curve header, curves in image
+    pixels, run time) for regression checks.
     """
     t0 = time.perf_counter()
 
@@ -55,13 +60,27 @@ def digitize_plot(
     canvas_h = y_max - y_min
     logger.info(f"Canvas: {canvas_w}x{canvas_h} px  ({x_min},{y_min})→({x_max},{y_max})")
 
+    # Text lines from a PDF sidecar (<image>.json written by --pdf) replace OCR
+    # of the in-plot labels: exact text and position, subscripts included.
+    text_labels = None
+    sidecar = image_path.with_suffix(".json")
+    if sidecar.exists():
+        try:
+            text_labels = json.loads(sidecar.read_text(encoding="utf-8")).get("text")
+        except (ValueError, AttributeError):
+            text_labels = None
+        if text_labels is not None:
+            logger.info(f"Using {len(text_labels)} text lines from {sidecar.name}")
+
     # 3. Read axis calibration
     debug: Optional[dict] = {} if debug_svg else None
     x_calib, y_calib = read_axes(
-        img_array, plot_area, x_range=x_range, y_range=y_range, debug=debug
+        img_array, plot_area, x_range=x_range, y_range=y_range, debug=debug,
+        text_labels=text_labels,
     )
 
     # 4. Extract curves
+    annot: dict = {}
     curves = extract_curves(
         img_array, plot_area,
         method=method, smoothing=smoothing,
@@ -72,7 +91,21 @@ def digitize_plot(
         notch_factor=notch_factor,
         target_colors=target_colors, color_tolerance=color_tolerance,
         debug=debug,
+        text_labels=text_labels,
+        annot=annot,
     )
+
+    # 4a. Name the curves by their labels ("T_A = 25 °C" -> column "T_A in °C", value "25")
+    names, curve_header, shafts = assign_labels(
+        curves, annot.get("labels") or [], annot.get("label_arrows") or [],
+        plot_area)
+    if shafts:
+        logger.info(f"Dropped arrow shafts traced as curves: {', '.join(shafts)}")
+        curves = {k: v for k, v in curves.items() if k not in shafts}
+    if names:
+        logger.info(f"Curve labels ({curve_header}): "
+                    + ", ".join(f"{k}->{v}" for k, v in names.items()))
+        curves = {names.get(k, k): v for k, v in curves.items()}
     n_curves = len(curves)
     logger.info(f"Curves found: {n_curves}  (method={method})")
 
@@ -107,13 +140,11 @@ def digitize_plot(
         )
         grid_model = (debug or {}).get("grid_model")
         if grid_model is not None:
-            import json
             json_path = debug_svg.with_name(debug_svg.stem + "_grid.json")
             json_path.write_text(json.dumps(grid_model, indent=2), encoding="utf-8")
             logger.info(f"Grid model JSON written to: {json_path}")
         arrow_model = (debug or {}).get("arrow_model")
         if arrow_model is not None:
-            import json
             widths = (debug or {}).get("widths")
             if widths is not None:
                 arrow_model = {**arrow_model, "widths_px": widths}
@@ -129,14 +160,19 @@ def digitize_plot(
             dy = pixel_to_data(py, y_calib)
             rows.append((curve_name, dx, dy))
 
-    # Sort for cleaner output
-    rows.sort(key=lambda r: (r[0], r[1]))
+    # Sort for cleaner output (numeric label values numerically)
+    def _name_key(name: str):
+        try:
+            return (0, float(name), "")
+        except ValueError:
+            return (1, 0.0, name)
+    rows.sort(key=lambda r: (_name_key(r[0]), r[1]))
 
     # 6. Write CSV
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", newline="") as fh:
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["curve", "x", "y"])
+        writer.writerow([curve_header, "x", "y"])
         for curve_name, dx, dy in rows:
             writer.writerow([curve_name, f"{dx:.6f}", f"{dy:.6f}"])
 
@@ -150,3 +186,12 @@ def digitize_plot(
         logger.info(f"    {cname}: {len(pts)} pts")
     logger.info(f"  Processing time   : {elapsed:.2f} s")
     logger.info(f"  Output            : {output_path}")
+
+    return {
+        "plot_area": [int(v) for v in plot_area],
+        "x_calib": list(x_calib),
+        "y_calib": list(y_calib),
+        "curve_header": curve_header,
+        "curves_px": {k: np.asarray(v, dtype=float).round(2).tolist() for k, v in curves.items()},
+        "time_s": round(elapsed, 2),
+    }

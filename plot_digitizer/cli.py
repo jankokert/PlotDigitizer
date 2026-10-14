@@ -42,10 +42,32 @@ def _parse_color(s: str) -> tuple[int, int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert a plot image to CSV data",
+        description="Convert a plot image (or a figure of a datasheet PDF) to CSV data",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--image", required=True, help="Path to plot image file")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image", help="Path to plot image file")
+    src.add_argument(
+        "--pdf",
+        help="Datasheet PDF; with --figure the figure is located by its caption, "
+             "exported as '<part> - Figure <n> - <title>.{png,pdf,json}' and digitized",
+    )
+    parser.add_argument(
+        "--figure", nargs="+", metavar="N",
+        help="Figure number(s) to extract from --pdf (e.g. 3 4)",
+    )
+    parser.add_argument(
+        "--extract-only", action="store_true",
+        help="With --pdf: only export the figure PNG/PDF/JSON, do not digitize",
+    )
+    parser.add_argument(
+        "--dpi", type=int, default=600,
+        help="Rendering resolution of the PNG exported from --pdf",
+    )
+    parser.add_argument(
+        "--out-dir",
+        help="Directory for files exported from --pdf (default: next to the PDF)",
+    )
     parser.add_argument(
         "--output", help="Output CSV path (default: same as image with .csv extension)"
     )
@@ -181,7 +203,35 @@ def main() -> None:
     setup_logging(verbose=args.debug_files is not None)
     logger = logging.getLogger(__name__)
 
-    image_path = Path(args.image)
+    if args.pdf:
+        pdf_path = Path(args.pdf)
+        if not pdf_path.exists():
+            logger.error(f"PDF file not found: {pdf_path}")
+            sys.exit(1)
+        if not args.figure:
+            parser.error("--pdf requires --figure")
+        if args.output and len(args.figure) > 1:
+            parser.error("--output cannot be used with several --figure values")
+        from .pdf_extractor import extract_figure
+        out_dir = Path(args.out_dir) if args.out_dir else pdf_path.parent
+        images = []
+        for fig in args.figure:
+            try:
+                info = extract_figure(pdf_path, fig, out_dir=out_dir, dpi=args.dpi)
+            except LookupError as exc:
+                logger.error(str(exc))
+                sys.exit(1)
+            images.append(out_dir / info.png)
+        if args.extract_only:
+            return
+    else:
+        images = [Path(args.image)]
+
+    for image_path in images:
+        _digitize(args, image_path, logger)
+
+
+def _digitize(args: argparse.Namespace, image_path: Path, logger: logging.Logger) -> None:
     if not image_path.exists():
         logger.error(f"Image file not found: {image_path}")
         sys.exit(1)

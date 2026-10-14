@@ -19,18 +19,26 @@ def read_axes(
     x_range: Optional[tuple[float, float]] = None,
     y_range: Optional[tuple[float, float]] = None,
     debug: Optional[dict] = None,
+    text_labels: Optional[list[dict]] = None,
 ) -> tuple[Calibration, Calibration]:
     """
     Return (x_calib, y_calib) as linear calibration tuples.
 
     Each calibration = (px_low, val_low, px_high, val_high) mapping
     a pixel coordinate to a data-space value.
+
+    text_labels: known text lines ``{text, box}`` in image pixels (PDF text
+    layer).  Their numeric tick labels are used instead of OCR when an axis
+    has at least two of them.
     """
     x_min, y_min, x_max, y_max = plot_area
+    tick_x, tick_y = _ticks_from_text(text_labels, plot_area) if text_labels else ([], [])
 
     if x_range is not None:
         x_calib: Calibration = (x_min, x_range[0], x_max, x_range[1], "lin")
         logger.info(f"X axis: manual range {x_range}")
+    elif len(tick_x) >= 2:
+        x_calib = _calib_from_ticks(tick_x, x_min, x_max, "X", debug, "x_ticks") or _default_x(plot_area)
     else:
         x_calib = _read_x_axis(img_array, plot_area, debug) or _default_x(plot_area)
 
@@ -39,6 +47,8 @@ def read_axes(
         # y_range = (y_min_value, y_max_value) — min at bottom, max at top
         y_calib: Calibration = (y_min, y_range[1], y_max, y_range[0], "lin")
         logger.info(f"Y axis: manual range {y_range}")
+    elif len(tick_y) >= 2:
+        y_calib = _calib_from_ticks(tick_y, y_min, y_max, "Y", debug, "y_ticks") or _default_y(plot_area)
     else:
         y_calib = _read_y_axis(img_array, plot_area, debug) or _default_y(plot_area)
 
@@ -145,6 +155,42 @@ def _read_y_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
     calib = _fit_axis(calibration_pts, y_min, y_max, "Y")
     if debug is not None:
         debug["y_ticks"] = _ticks_for_debug(calibration_pts, calib)
+    return calib
+
+
+def _parse_number(text: str) -> Optional[float]:
+    t = text.strip().replace("−", "-").replace(",", ".").replace(" ", "")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _ticks_from_text(text_labels: list[dict], plot_area):
+    """Split numeric text lines into x ticks (below the canvas) and y ticks
+    (left of it): lists of (pixel position of the label centre, value)."""
+    x_min, y_min, x_max, y_max = plot_area
+    w, h = x_max - x_min, y_max - y_min
+    xs, ys = [], []
+    for lab in text_labels:
+        v = _parse_number(lab["text"])
+        if v is None or not lab.get("horizontal", True):
+            continue
+        x0, y0, x1, y1 = lab["box"]
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if y_max - 0.02 * h <= y0 and cy <= y_max + 0.15 * h                 and x_min - 0.05 * w <= cx <= x_max + 0.05 * w:
+            xs.append((cx, v))
+        elif x1 <= x_min + 0.02 * w and cx >= x_min - 0.25 * w                 and y_min - 0.05 * h <= cy <= y_max + 0.05 * h:
+            ys.append((cy, v))
+    return sorted(xs), sorted(ys)
+
+
+def _calib_from_ticks(pts, p_lo, p_hi, name, debug, key) -> Optional[Calibration]:
+    logger.info(f"{name} ticks (PDF text): "
+                + ", ".join(f"{v:g}@px{int(p)}" for p, v in pts))
+    calib = _fit_axis(pts, p_lo, p_hi, name)
+    if debug is not None:
+        debug[key] = _ticks_for_debug(pts, calib)
     return calib
 
 

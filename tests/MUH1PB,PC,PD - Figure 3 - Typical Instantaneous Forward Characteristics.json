@@ -1,0 +1,248 @@
+{
+  "source_pdf": "MUH1PB,PC,PD.pdf",
+  "figure": "3",
+  "page": 3,
+  "caption": "Fig. 3 - Typical Instantaneous Forward Characteristics",
+  "title": "Typical Instantaneous Forward Characteristics",
+  "clip": [
+    64.46,
+    105.68,
+    265.84,
+    269.26
+  ],
+  "dpi": 600,
+  "png": "MUH1PB,PC,PD - Figure 3 - Typical Instantaneous Forward Characteristics.png",
+  "pdf": "MUH1PB,PC,PD - Figure 3 - Typical Instantaneous Forward Characteristics.pdf",
+  "text": [
+    {
+      "text": "0.01",
+      "box": [
+        141,
+        1124,
+        243,
+        1176
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.1",
+      "box": [
+        170,
+        852,
+        243,
+        905
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.4",
+      "box": [
+        372,
+        1186,
+        445,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.6",
+      "box": [
+        506,
+        1186,
+        579,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.8",
+      "box": [
+        639,
+        1186,
+        712,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1",
+      "box": [
+        787,
+        1186,
+        816,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1.2",
+      "box": [
+        905,
+        1186,
+        978,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1.4",
+      "box": [
+        1039,
+        1186,
+        1112,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1.6",
+      "box": [
+        1172,
+        1186,
+        1245,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1.8",
+      "box": [
+        1305,
+        1186,
+        1378,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "2.0",
+      "box": [
+        1438,
+        1186,
+        1511,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "2.2",
+      "box": [
+        1572,
+        1186,
+        1645,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.2",
+      "box": [
+        227,
+        1186,
+        300,
+        1239
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1",
+      "box": [
+        214,
+        581,
+        243,
+        633
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "10",
+      "box": [
+        173,
+        309,
+        232,
+        362
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "100",
+      "box": [
+        144,
+        38,
+        232,
+        90
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "Instantaneous Forward Voltage (V)",
+      "box": [
+        481,
+        1270,
+        1401,
+        1330
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 150 °C",
+      "box": [
+        414,
+        322,
+        692,
+        386
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 125 °C",
+      "box": [
+        1163,
+        457,
+        1441,
+        521
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 25 °C",
+      "box": [
+        840,
+        1051,
+        1089,
+        1115
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "Instantaneous Forward Current (A)",
+      "box": [
+        38,
+        142,
+        98,
+        1067
+      ],
+      "horizontal": false
+    },
+    {
+      "text": "T_A = 175 °C",
+      "box": [
+        559,
+        117,
+        836,
+        182
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 100 °C",
+      "box": [
+        859,
+        814,
+        1136,
+        879
+      ],
+      "horizontal": true
+    }
+  ]
+}

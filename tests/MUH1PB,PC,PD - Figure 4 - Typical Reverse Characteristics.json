@@ -1,0 +1,248 @@
+{
+  "source_pdf": "MUH1PB,PC,PD.pdf",
+  "figure": "4",
+  "page": 3,
+  "caption": "Fig. 4 - Typical Reverse Characteristics",
+  "title": "Typical Reverse Characteristics",
+  "clip": [
+    64.46,
+    301.82,
+    266.65,
+    465.52
+  ],
+  "dpi": 600,
+  "png": "MUH1PB,PC,PD - Figure 4 - Typical Reverse Characteristics.png",
+  "pdf": "MUH1PB,PC,PD - Figure 4 - Typical Reverse Characteristics.pdf",
+  "text": [
+    {
+      "text": "100",
+      "box": [
+        149,
+        37,
+        237,
+        90
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "10",
+      "box": [
+        176,
+        255,
+        234,
+        308
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "1",
+      "box": [
+        214,
+        473,
+        243,
+        526
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.1",
+      "box": [
+        171,
+        691,
+        244,
+        744
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "0.001",
+      "box": [
+        113,
+        1127,
+        244,
+        1179
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "10",
+      "box": [
+        249,
+        1185,
+        308,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "20",
+      "box": [
+        397,
+        1185,
+        455,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "30",
+      "box": [
+        545,
+        1185,
+        603,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "40",
+      "box": [
+        692,
+        1185,
+        751,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "50",
+      "box": [
+        840,
+        1185,
+        898,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "60",
+      "box": [
+        988,
+        1185,
+        1046,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "70",
+      "box": [
+        1135,
+        1185,
+        1194,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "80",
+      "box": [
+        1283,
+        1185,
+        1342,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "90",
+      "box": [
+        1431,
+        1185,
+        1489,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "100",
+      "box": [
+        1564,
+        1185,
+        1652,
+        1238
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "Percent of Rated Peak Reverse Voltage (%)",
+      "box": [
+        365,
+        1271,
+        1521,
+        1331
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "Instantaneous Reverse Current (µA)",
+      "box": [
+        38,
+        122,
+        99,
+        1084
+      ],
+      "horizontal": false
+    },
+    {
+      "text": "0.01",
+      "box": [
+        142,
+        909,
+        244,
+        961
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 25 °C",
+      "box": [
+        489,
+        936,
+        737,
+        1000
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 100 °C",
+      "box": [
+        489,
+        589,
+        767,
+        654
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 125 °C",
+      "box": [
+        489,
+        445,
+        767,
+        509
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 150 °C",
+      "box": [
+        489,
+        343,
+        767,
+        407
+      ],
+      "horizontal": true
+    },
+    {
+      "text": "T_A = 175 °C",
+      "box": [
+        489,
+        130,
+        767,
+        194
+      ],
+      "horizontal": true
+    }
+  ]
+}

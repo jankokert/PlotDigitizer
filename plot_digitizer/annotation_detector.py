@@ -77,6 +77,9 @@ def detect_text_boxes(
 
 def detect_legend_boxes(
     text_boxes: list[tuple[int, int, int, int]],
+    texts: Optional[list[str]] = None,
+    max_pitch_spread: float = 0.25,
+    min_members: int = 3,
 ) -> list[tuple[int, int, int, int]]:
     """
     Merge vertically-stacked, horizontally-aligned text boxes into one enclosing
@@ -84,8 +87,18 @@ def detect_legend_boxes(
     whole legend rectangle lets later stages exclude it from grid/curve analysis.
 
     Two boxes join a legend when their x-ranges overlap by most of the narrower
-    box and they sit at different y.  A legend needs at least two members.
+    box and they sit at different y.  A legend is a REGULAR stack: at least
+    `min_members` rows at an even pitch (spread of the row-to-row distances
+    ≤ `max_pitch_spread` × their median).  Callout labels that merely happen
+    to be left-aligned (MUH1PB Fig. 4: each label next to its own curve) sit
+    at irregular distances.
+
+    A plot labels its curves either with callouts or with ONE legend holding
+    all of them.  So if `texts` form a label family ("T_A = 25 °C", …), a
+    legend must contain every member of that family.
     """
+    from .label_parser import parse_labels
+    family = parse_labels(texts) if texts is not None else None
     n = len(text_boxes)
     parent = list(range(n))
 
@@ -113,7 +126,13 @@ def detect_legend_boxes(
 
     legends = []
     for members in groups.values():
-        if len(members) < 2:
+        if len(members) < min_members:
+            continue
+        cy = sorted((text_boxes[m][1] + text_boxes[m][3]) / 2 for m in members)
+        pitch = np.diff(cy)
+        if (pitch.max() - pitch.min()) > max_pitch_spread * float(np.median(pitch)):
+            continue
+        if family is not None and not set(family.members) <= set(members):
             continue
         mb = [text_boxes[m] for m in members]
         # A real legend is a vertical STACK: the members' left edges are aligned
@@ -371,7 +390,8 @@ def detect_arrows(
     # only for labels that form a LEGEND (a vertical stack, e.g. USFF 0.05–0.25
     # A). Horizontal callout arrows are a legend pattern; restricting to it keeps
     # a lone scattered label from latching onto a bold grid line as a "shaft".
-    legends = detect_legend_boxes([lab["box"] for lab in labels])
+    legends = detect_legend_boxes([lab["box"] for lab in labels],
+                                  [lab["text"] for lab in labels])
 
     def _in_legend(box):
         for lx0, ly0, lx1, ly1 in legends:

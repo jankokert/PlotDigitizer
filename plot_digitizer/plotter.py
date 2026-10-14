@@ -50,12 +50,14 @@ def plot_csv(
 
     # Read CSV
     curves: dict[str, tuple[list[float], list[float]]] = {}
-    with open(csv_path, newline="") as fh:
-        for row in csv.DictReader(fh):
-            name = row["curve"]
+    # First column names the curve: "curve" or a label header like "T_A in °C".
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)
+        for name, x, y in reader:
             curves.setdefault(name, ([], []))
-            curves[name][0].append(float(row["x"]))
-            curves[name][1].append(float(row["y"]))
+            curves[name][0].append(float(x))
+            curves[name][1].append(float(y))
 
     if not curves:
         logger.warning("CSV is empty — nothing to plot")

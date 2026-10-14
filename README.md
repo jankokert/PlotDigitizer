@@ -157,6 +157,38 @@ uv run plot_digitizer --image plot.png --debug-files
 
 Output is written next to the image as `plot.csv` (columns: `curve`, `x`, `y`).
 
+### Figures straight from a datasheet PDF
+
+```bash
+# Locate "Fig. 3" / "Figure 3" by its caption, export it and digitize it
+uv run plot_digitizer --pdf "MUH1PB,PC,PD.pdf" --figure 3 4
+
+# Only export the figures (no digitizing); default 600 dpi
+uv run plot_digitizer --pdf datasheet.pdf --figure 3 --extract-only --dpi 600 --out-dir figs
+```
+
+For every figure three files are written (next to the PDF unless `--out-dir`),
+named `<part> - Figure <n> - <caption title>`:
+
+| File | Contents |
+|------|----------|
+| `.png` | High-resolution render of the plot incl. tick labels and axis titles, caption excluded — the digitizer input |
+| `.pdf` | The same region as a vector crop |
+| `.json` | Source PDF, page, crop rectangle (PDF points), caption text, dpi |
+
+The caption must start a text line (`Fig. 3 - …`), so references in body text
+are ignored. The plot is the cluster of vector drawings / images directly
+above (or below) the caption, grown by nearby text. Scanned PDFs without a
+text layer are not supported yet.
+
+The JSON also holds the PDF text lines inside the crop (in PNG pixels, with
+subscripts as `T_A`). When digitizing `<name>.png`, a sibling `<name>.json`
+replaces OCR for the in-plot labels. Curve families such as `T_A = 25 °C`,
+`T_A = 100 °C` are split into symbol, value and unit: the CSV's first column
+is headed `T_A in °C` and holds just `25`, `100`, … Labels are matched to
+curves via their arrows (traced arrow shafts are followed to the curve and
+dropped from the data), or by vertical order when there are no arrows.
+
 ### Debug artefacts (`--debug-files`)
 
 `--debug-files [PATH]` turns on verbose logging and writes, next to the output CSV:
@@ -276,6 +308,21 @@ Test categories: **core accuracy** (single/multi-curve, PNG/JPEG, 150/300 dpi, o
 with/without grid/JPEG), and **regression** (density-gated notch mode, notch discrimination, thin
 sparse-column curves).
 
+### Regression check on real datasheet plots
+
+```bash
+.venv/Scripts/python.exe tests/regression.py                    # compare with baseline
+.venv/Scripts/python.exe tests/regression.py --update-baseline  # accept the current results
+```
+
+Runs all real test plots in parallel and compares them with
+`tests/regression/baseline/*.json`. It checks the canvas, the axis
+calibration, the CSV header, the curve names and the curve geometry (mean
+and max pixel distance: `same` < 0.5 px, `close` < 3 px, otherwise
+`CHANGED`). Run it before and after every algorithm change. The current
+run's artefacts (CSV, debug SVG/PNG/JSON, log) go to
+`tests/regression/current/<case>/`.
+
 ---
 
 ## Dependencies
@@ -288,6 +335,7 @@ sparse-column curves).
 | `matplotlib` | Optional result plot |
 | `pytesseract` | OCR for axis labels (optional — manual ranges bypass it) |
 | `opencv-python-headless` | `cv` extraction method (optional) |
+| `pymupdf` | Figure extraction from datasheet PDFs (`--pdf`) |
 
 Tesseract OCR engine must be installed separately:
 ```bash

@@ -19,3 +19,4 @@ wheels/
 # Committed documentation assets — override the broad ignores above
 !docs/*.svg
 !docs/*.png
+tests/regression/current/
