@@ -54,7 +54,7 @@ _MUH3 = "MUH1PB,PC,PD - Figure 3 - Typical Instantaneous Forward Characteristics
 _MUH4 = "MUH1PB,PC,PD - Figure 4 - Typical Reverse Characteristics.png"
 CASES = {
     "BAT46GW_fig3": "BAT46GW - Figure 3 - Typical Junction Capacitance.png",
-    "CMZ53xxB": "CMZ53xxB Zender diode - V_Z-I_R.png",
+    "CMZ53xxB": "CMZ53xxB Zener diode - V_Z-I_R.png",
     "USFF_1206": "USFF_1206 - with axis labels.png",
     "MUH1PB_fig3": _MUH3,
     "MUH1PB_fig4": _MUH4,
