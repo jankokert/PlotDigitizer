@@ -30,8 +30,12 @@ class LabelFamily:
     values: list[str]           # per input label: "25", or "" if not a member
     members: list[int]          # indices of the labels that belong to the family
 
+    kind: str = "value"         # "value" ("T_A = 25 °C") or "part" ("CMZ5334B")
+
     @property
     def header(self) -> str:
+        if self.kind == "part":
+            return "part"
         if self.symbol and self.unit:
             return f"{self.symbol} in {self.unit}"
         return self.symbol or (f"in {self.unit}" if self.unit else "curve")
@@ -66,20 +70,75 @@ def parse_label(text: str) -> tuple[str | None, str, str | None] | None:
     return sym, num, _normalize_unit(m["unit"])
 
 
+_PART_RE = re.compile(r"^([A-Za-z]{2,})(\d{2,}[A-Za-z0-9-]*)$")
+
+
+def _part_family(texts: list[str]) -> LabelFamily | None:
+    """Labels that are part numbers of one series ("CMZ5334B", "CMZ5335B"):
+    same letter prefix, differing numbers."""
+    keys = [(_PART_RE.match(t.strip()) or None) for t in texts]
+    prefixes = Counter(m.group(1).upper() for m in keys if m)
+    if not prefixes:
+        return None
+    prefix, n = prefixes.most_common(1)[0]
+    if n < 2:
+        return None
+    values = [""] * len(texts)
+    members = []
+    for i, t in enumerate(texts):
+        m = keys[i]
+        if m and m.group(1).upper() == prefix:
+            # OCR may mix the case of the letters ("cmz5346B"): normalise.
+            values[i] = prefix + m.group(2)
+            members.append(i)
+            continue
+        fixed = _ocr_fix_part(t, prefix)
+        if fixed:
+            values[i] = fixed
+            members.append(i)
+    return LabelFamily(symbol=None, unit=None, values=values, members=members, kind="part")
+
+
+# Letters OCR typically reads in place of digits.
+_DIGIT_LOOKALIKE = str.maketrans({"S": "5", "O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+                                  "|": "1", "Z": "2", "E": "6", "G": "6", "B": "8", "T": "7"})
+
+
+def _ocr_fix_part(text: str, prefix: str) -> str | None:
+    """'cMzs34eB' with series prefix 'CMZ' -> 'CMZ5346B': after the prefix,
+    letters that look like digits are read as digits (the last character may
+    be a genuine suffix letter)."""
+    t = text.strip().upper()
+    if not t.startswith(prefix) or len(t) < len(prefix) + 3:
+        return None
+    rest = t[len(prefix):]
+    body, last = rest[:-1].translate(_DIGIT_LOOKALIKE), rest[-1]
+    if not body.isdigit():
+        return None
+    if not (last.isdigit() or last.isalpha()):
+        return None
+    return prefix + body + last
+
+
 def parse_labels(texts: list[str]) -> LabelFamily | None:
     """Find the largest group of labels sharing symbol and unit.
 
     Returns None if fewer than two labels share a (symbol, unit) pair, or
     if the pair is empty (bare numbers): a single "T_J = 25 °C" next to
-    "f = 1.0 MHz" is a test-condition note, not a curve family.
+    "f = 1.0 MHz" is a test-condition note, not a curve family.  Labels that
+    are part numbers of one series form a "part" family instead (the larger
+    family wins).
     """
     parsed = [parse_label(t) for t in texts]
     keys = Counter((p[0], p[2]) for p in parsed if p is not None)
+    part = _part_family(texts)
     if not keys:
-        return None
+        return part
     (sym, unit), n = keys.most_common(1)[0]
     if n < 2 or (sym is None and unit is None):
-        return None
+        return part
+    if part is not None and len(part.members) > n:
+        return part
     members = [i for i, p in enumerate(parsed) if p is not None and (p[0], p[2]) == (sym, unit)]
     values = [parsed[i][1] if i in members else "" for i in range(len(texts))]
     return LabelFamily(symbol=sym, unit=unit, values=values, members=members)
@@ -107,7 +166,7 @@ def _box_dist(b: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return np.hypot(dx, dy)
 
 
-def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
+def assign_labels(curves: dict, labels: list[dict],
                   plot_area: tuple[int, int, int, int],
                   extra_fragments: dict | None = None,
                   ) -> tuple[dict[str, str], str, list[str]]:
@@ -115,7 +174,6 @@ def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
 
     curves:    {name: Nx2 (x, y) image pixels}
     labels:    [{text, box}] in canvas pixels
-    arrows:    detect_arrows() output (``label``, ``tip_x``, ``tip_y``, canvas px)
     plot_area: canvas (x0, y0, x1, y1) in the image
     extra_fragments: arrow candidates {name: [end, ..., end]} in image pixels
                (vector shafts, or raster shafts followed to their tip)
@@ -125,8 +183,9 @@ def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
 
     * Arrows: a fragment (short traced curve or extra fragment) with one end
       at a label box and pointing away from it is that label's arrow; its
-      other end is the tip.  Labels without one fall back to a detected
-      arrowhead (tips on the canvas border are frame false positives).
+      other end is the tip.  (Arrowheads paired greedily with the nearest
+      label proved unreliable and are not used: a label without a shaft takes
+      what the global assignment leaves it.)
     * Labels with an arrow, or a mix: Hungarian assignment on tip -> curve
       distance (labels without an arrow pay a large offset plus their box
       distance), so a sloppy arrow touching a neighbour is still resolved
@@ -170,18 +229,6 @@ def assign_labels(curves: dict, labels: list[dict], arrows: list[dict],
         pts = np.asarray(pool[n], dtype=float)
         tips[k] = pts[-1] if j == 0 else pts[0]
         used.append(n)
-
-    margin = 8
-    free_arrows = [a for a in arrows
-                   if margin < a["tip_x"] < (x1 - x0) - margin
-                   and margin < a["tip_y"] < (y1 - y0) - margin]
-    for k, i in enumerate(members):
-        if tips[k] is not None:
-            continue
-        hit = next((a for a in free_arrows if a["label"] == labels[i]["text"]), None)
-        if hit is not None:
-            free_arrows.remove(hit)
-            tips[k] = np.array([hit["tip_x"] + x0, hit["tip_y"] + y0], dtype=float)
 
     if all(t is None for t in tips) and len(members) == len(cands):
         xs = [(b[0] + b[2]) / 2 for b in boxes]

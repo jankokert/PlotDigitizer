@@ -35,6 +35,13 @@ def detect_plot_area(img_array: np.ndarray) -> tuple[int, int, int, int]:
             # and the outward ticks past it are cut off.
             y_min, y_max = int(h_rows[0]), min(h, int(h_rows[-1]) + 1)
             x_min, x_max = int(v_cols[0]), min(w, int(v_cols[-1]) + 1)
+            if y_max - y_min < 0.2 * h or x_max - x_min < 0.2 * w:
+                # No frame/grid, only L-shaped axes: one line each way.  The
+                # plot then spans as far as the axis lines themselves reach.
+                ys = _run_span(is_dark.T, v_cols)
+                xs = _run_span(is_dark, h_rows)
+                y_min, y_max = min(y_min, ys[0]), max(y_max, ys[1])
+                x_min, x_max = min(x_min, xs[0]), max(x_max, xs[1])
             logger.info(
                 f"Detected plot area (threshold={threshold}): "
                 f"x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
@@ -46,6 +53,20 @@ def detect_plot_area(img_array: np.ndarray) -> tuple[int, int, int, int]:
     x_min, x_max = int(w * 0.12), int(w * 0.88)
 
     return x_min, y_min, x_max, y_max
+
+
+def _run_span(mask: np.ndarray, lines: np.ndarray) -> tuple[int, int]:
+    """(start, end+1) covered by the longest dark run of each of `lines`
+    (rows of `mask`)."""
+    lo, hi = mask.shape[1], 0
+    for r in lines:
+        row = np.concatenate([[0], mask[r].astype(np.int8), [0]])
+        d = np.diff(row)
+        starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+        if len(starts):
+            k = int(np.argmax(ends - starts))
+            lo, hi = min(lo, int(starts[k])), max(hi, int(ends[k]))
+    return lo, hi
 
 
 def _max_run_lengths(mask: np.ndarray) -> np.ndarray:

@@ -34,6 +34,8 @@ from typing import Optional
 
 import numpy as np
 
+# Pixel constants below were tuned at ~150 dpi; they are multiplied by the
+# resolution `scale` (>= 1, from the curve pen width) for high-dpi renders.
 _T_BODY = 1.2         # thick-pixel floor for the hull (drops 1 px shaft/curve)
 _HALF_ANGLE_RANGE = (6.0, 55.0)   # plausible arrowhead half-angle (deg)
 _LEN_RANGE = (4.0, 34.0)          # plausible head length (px)
@@ -119,16 +121,17 @@ def _perp_halfwidth(fg: np.ndarray, c: np.ndarray, n: np.ndarray, lim: int = 14)
     return 0.5 * (p + q + 1)
 
 
-def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional[dict]:
+def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict,
+                     scale: float = 1.0) -> Optional[dict]:
     """Fit the head triangle for one confirmed callout (its head_box + tip)."""
     h, w = fg.shape
     hx0, hy0, hx1, hy1 = anchor["head_box"]
     tip = np.array([float(anchor["tip_x"]), float(anchor["tip_y"])])
     tail = np.array([float(anchor["tail_x"]), float(anchor["tail_y"])])
-    pad = 3
+    pad = int(round(3 * scale))
     y0, y1 = max(0, hy0 - pad), min(h, hy1 + pad + 1)
     x0, x1 = max(0, hx0 - pad), min(w, hx1 + pad + 1)
-    ys, xs = np.where((fg[y0:y1, x0:x1]) & (dist[y0:y1, x0:x1] >= _T_BODY))
+    ys, xs = np.where((fg[y0:y1, x0:x1]) & (dist[y0:y1, x0:x1] >= _T_BODY * scale))
     if len(xs) < 5:
         return None
     P = np.stack([xs + x0, ys + y0], axis=1).astype(float)
@@ -145,7 +148,7 @@ def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional
     axis = apex - base_mid
     L = math.hypot(axis[0], axis[1])
     base_len = math.hypot(*(base[0] - base[1]))
-    if not (_LEN_RANGE[0] <= L <= _LEN_RANGE[1]) or base_len < 2.0:
+    if not (_LEN_RANGE[0] * scale <= L <= _LEN_RANGE[1] * scale) or base_len < 2.0 * scale:
         return None
     half_angle = math.degrees(math.atan2(base_len / 2.0, L))
     if not (_HALF_ANGLE_RANGE[0] <= half_angle <= _HALF_ANGLE_RANGE[1]):
@@ -158,20 +161,21 @@ def _fit_from_anchor(fg: np.ndarray, dist: np.ndarray, anchor: dict) -> Optional
     # visible black head is markedly wider than any line.  Take the widest ink
     # section across the rear half of the head.
     base_half = max(
-        _perp_halfwidth(fg, base_mid, n),
-        _perp_halfwidth(fg, apex - u * (0.8 * L), n),
-        _perp_halfwidth(fg, apex - u * (0.6 * L), n),
+        _perp_halfwidth(fg, base_mid, n, lim=int(round(14 * scale))),
+        _perp_halfwidth(fg, apex - u * (0.8 * L), n, lim=int(round(14 * scale))),
+        _perp_halfwidth(fg, apex - u * (0.6 * L), n, lim=int(round(14 * scale))),
         base_len / 2.0,
     )
     # shaft width: perpendicular ink thickness just behind the base
     back = base_mid - u * 2.0
     wpos = 0
-    while wpos < 8 and _sample(fg, back + n * (wpos + 1)):
+    wlim = int(round(8 * scale))
+    while wpos < wlim and _sample(fg, back + n * (wpos + 1)):
         wpos += 1
     wneg = 0
-    while wneg < 8 and _sample(fg, back - n * (wneg + 1)):
+    while wneg < wlim and _sample(fg, back - n * (wneg + 1)):
         wneg += 1
-    shaft_w = float(min(max(wpos + wneg + 1, 2), 8))
+    shaft_w = float(min(max(wpos + wneg + 1, 2), wlim))
     shaft_len = float(math.hypot(*(tail - base_mid)))
     return {"apex": apex, "base_mid": base_mid, "u": u, "theta": theta,
             "L": L, "half_angle": half_angle, "shaft_w": shaft_w,
@@ -268,6 +272,7 @@ def model_arrows(
     anchors: list[dict],
     resid_tol: float = 0.28,
     cover_on: float = 0.35,
+    scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, ArrowModel]:
     """Reconstruct the anchored arrows; return ``(arrow_gray, arrow_mask, model)``.
 
@@ -287,7 +292,7 @@ def model_arrows(
         return arrow_gray, arrow_mask, ArrowModel([], 0.0, 0.0, 0.0)
 
     dist = ndimage.distance_transform_edt(fg)
-    fits = [f for f in (_fit_from_anchor(fg, dist, a) for a in anchors) if f]
+    fits = [f for f in (_fit_from_anchor(fg, dist, a, scale) for a in anchors) if f]
     if not fits:
         return arrow_gray, arrow_mask, ArrowModel([], 0.0, 0.0, 0.0)
 

@@ -154,7 +154,12 @@ def digitize_plot(
                        "— falling back to raster")
     used_mode = "vector" if curves else "raster"
     if used_mode == "vector":
-        annot = {"labels": labels_in_canvas(text_labels or [], plot_area), "label_arrows": []}
+        if text_labels is not None:
+            labels = labels_in_canvas(text_labels, plot_area)
+        else:                         # text drawn as outlines: read it by OCR
+            from .annotation_detector import detect_text_labels_ocr
+            labels = detect_text_labels_ocr(img_array[y_min:y_max, x_min:x_max])
+        annot = {"labels": labels, "label_arrows": []}
         if debug is not None:
             debug["text_boxes"] = [lab["box"] for lab in annot["labels"]]
             debug["label_texts"] = [lab["text"] for lab in annot["labels"]]
@@ -175,7 +180,7 @@ def digitize_plot(
 
     # 4a. Name the curves by their labels ("T_A = 25 °C" -> column "T_A in °C", value "25")
     names, curve_header, shafts = assign_labels(
-        curves, annot.get("labels") or [], annot.get("label_arrows") or [],
+        curves, annot.get("labels") or [],
         plot_area, extra_fragments={**annot.get("fragments", {}), **vector_shafts})
     if shafts:
         logger.info(f"Arrow shafts used for labels: {', '.join(shafts)}")

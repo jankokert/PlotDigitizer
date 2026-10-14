@@ -176,8 +176,14 @@ named `<part> - Figure <n> - <caption title>`:
 | `.pdf` | The same region as a vector crop |
 | `.json` | Source PDF, page, crop rectangle (PDF points), caption text, dpi |
 
-The caption must start a text line (`Fig. 3 - …`), so references in body text
-are ignored. The plot is the cluster of vector drawings / images directly
+`--figure` takes a number (caption `Fig. 3 - …`, which must start a text line,
+so references in body text are ignored) **or a title text**, e.g.
+`--figure "Zener Voltage CMZ5334B thru CMZ5350B"`. Titles are searched in the
+text layer first, then by OCR of the rendered pages: many datasheets draw all
+plot text as glyph outlines. Such files are then named `<part> - <title>`.
+Tick labels and axis titles around the plot are found even when they are
+outlines; a word only joins a plot if it is closer to it than to any other
+plot on the page. The plot is the cluster of vector drawings / images directly
 above (or below) the caption, grown by nearby text. Scanned PDFs without a
 text layer are not supported yet.
 
@@ -207,7 +213,11 @@ The JSON also holds the PDF text lines inside the crop (in PNG pixels, with
 subscripts as `T_A`). When digitizing `<name>.png`, a sibling `<name>.json`
 replaces OCR for the in-plot labels. Curve families such as `T_A = 25 °C`,
 `T_A = 100 °C` are split into symbol, value and unit: the CSV's first column
-is headed `T_A in °C` and holds just `25`, `100`, … Labels are matched to
+is headed `T_A in °C` and holds just `25`, `100`, … Part-number series
+(`CMZ5334B`, `CMZ5335B`, …) form a `part` column instead. OCR look-alikes are
+tolerated (`cMzs34eB` → `CMZ5346B`). Without a PDF text layer, labels and
+tick numbers are read by OCR. Tick numbers may use thousands separators or a
+decimal comma, and lin/log is decided from the ticks that fit. Labels are matched to
 curves via their arrows (traced arrow shafts are followed to the curve and
 dropped from the data), or by vertical order when there are no arrows.
 
@@ -351,6 +361,9 @@ Quality metrics:
   vector curves, as mean, p95 and coverage. The *resolvable* figures cover
   only stretches where neighbouring curves are more than one stroke apart.
 - **Label check**: raster names against the vector twin.
+- **Data-twin check**: the same plot from another source (e.g. an old
+  screenshot against the datasheet PDF), compared in normalised data
+  coordinates, with label agreement and error as a % of the axis.
 
 Run it before and after every algorithm change. `--compare-only`
 re-compares the last run without running the pipeline again. The current

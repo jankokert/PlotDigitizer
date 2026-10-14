@@ -100,6 +100,7 @@ def extract_curves(
             pen = _pen_width(mask)
             body, thin = _split_thin(mask, pen)
             paths = _extract_trace(body, x_min, y_min, walkable)
+            paths = _link_pieces(paths, walkable, pen, (x_min, y_min))
             paths = _extend_ends_to_frame(paths, mask, walkable, pen, (x_min, y_min))
             # Jointly re-place the traces so their strokes explain the ink:
             # resolves bands where several curves merge (see curve_refine).
@@ -115,8 +116,37 @@ def extract_curves(
                 origin = np.array([x_min, y_min], dtype=float)
                 strokes = _stroke_mask(mask.shape, [q - origin for q in paths], pen)
                 frags = annot.setdefault("fragments", {})
-                for seg in _line_fragments(thin, pen):
+                boxes = [lab["box"] for lab in annot.get("labels") or []]
+                found: list[np.ndarray] = []
+                # Shaft candidates from two sources that fail differently: the
+                # curve mask (clean, but the arrow model may have removed hi-res
+                # shafts) and the ink before arrow removal (shafts kept, but at
+                # low resolution glyphs/heads attach to them).
+                hh, ww = thin.shape
+                sources = [thin]
+                if annot.get("shaft_ink") is not None:
+                    sources.append(_split_thin(annot["shaft_ink"], pen, rel=0.3)[1])
+                candidates = []
+                for src in sources:
+                    for cut in (False, True):
+                        t = src
+                        if cut:      # a shaft touching its label's glyphs
+                            t = src.copy()
+                            for bx0, by0, bx1, by1 in boxes:
+                                t[max(0, int(by0) - 2):min(hh, int(by1) + 3),
+                                  max(0, int(bx0) - 2):min(ww, int(bx1) + 3)] = False
+                        candidates += _line_fragments(t, pen, exclude=boxes)
+                for seg in candidates:
                     seg = _follow_arrow(seg, walkable, strokes, pen)
+                    # Pieces of one shaft (cut apart by grid lines) extend to
+                    # the same arrow: keep it once, and only if long enough.
+                    if float(np.hypot(*(seg[1] - seg[0]))) < max(10.0, 4.0 * pen):
+                        continue
+                    if any(max(np.hypot(*(seg[0] - f[0])), np.hypot(*(seg[1] - f[1]))) < pen
+                           or max(np.hypot(*(seg[0] - f[1])), np.hypot(*(seg[1] - f[0]))) < pen
+                           for f in found):
+                        continue
+                    found.append(seg)
                     frags[f"shaft_r{len(frags):02d}"] = seg + origin
             # Order the curves left-to-right (seg00 = leftmost) by their median x,
             # so the segment index matches the on-plot order and the legend.
@@ -358,7 +388,15 @@ def _segment_by_color(
         _ink0 = (s < 0.30) & (v < 0.90)
         _ocr_labels = (text_labels if text_labels is not None
                        else detect_text_labels_ocr(canvas))
-        label_arrows = detect_arrows(canvas, grid_mask, labels=_ocr_labels)
+        # Resolution scale for the pixel constants of the arrow detectors
+        # (tuned at ~150 dpi, pen <= ~6 px): 1 there, larger for hi-res renders.
+        pen0 = _pen_width(_ink0 & ~grid_mask) if (_ink0 & ~grid_mask).any() else 1.0
+        res_scale = 1.0 if pen0 <= 7.0 else pen0 / 6.0
+        if annot is not None:
+            # Arrow shafts are looked for on the ink BEFORE the arrow model
+            # removes the arrows from the curve mask.
+            annot["shaft_ink"] = _ink0 & ~grid_mask
+        label_arrows = detect_arrows(canvas, grid_mask, labels=_ocr_labels, scale=res_scale)
         if annot is not None:
             annot["labels"] = _ocr_labels
             annot["label_arrows"] = label_arrows
@@ -367,10 +405,11 @@ def _segment_by_color(
         # anti-aliased footprint; union with the horizontal on-grid shaft removal
         # so we never remove less than before.
         arrow_gray, arrow_model_mask, arrow_obj = model_arrows(
-            s, v, grid_mask, label_arrows)
+            s, v, grid_mask, label_arrows, scale=res_scale)
         arrow_mask = arrow_model_mask
         if label_arrows:
-            arrow_mask = arrow_mask | _arrow_removal_mask(label_arrows, _ink0)
+            arrow_mask = arrow_mask | _arrow_removal_mask(
+                label_arrows, _ink0, cross_thick=int(round(8 * res_scale)))
         grid_mask |= arrow_mask
         if arrow_obj.arrows:
             logger.info(
@@ -987,6 +1026,71 @@ def _extract_trace(
     return paths
 
 
+def _end_frames(p: np.ndarray, pen: float):
+    """[(point, outward unit direction)] for the start and the end of `p`,
+    the direction taken over ~2 pens of arc."""
+    out = []
+    for q in (p[::-1], p):                      # start (reversed), end
+        end = q[-1]
+        back = q[:-1]
+        d = np.hypot(*(back - end).T)
+        far = np.flatnonzero(d >= 2.0 * pen)
+        ref = back[far[-1]] if len(far) else q[0]
+        v = end - ref
+        n = float(np.hypot(*v))
+        out.append((end, v / n if n > 1e-9 else np.zeros(2)))
+    return out
+
+
+def _link_pieces(paths: list[np.ndarray], walkable: np.ndarray, pen: float,
+                 origin, max_gap: float = 6.0, max_angle: float = 35.0) -> list[np.ndarray]:
+    """Join traced pieces of one curve that a gap split apart.
+
+    Where a curve runs tangentially along a grid line, the grid subtraction
+    removes it over a stretch and the tracer returns two pieces.  Two piece
+    ends are joined if they are close (<= `max_gap` pens), the pieces head
+    towards each other (all three directions within `max_angle`), and the
+    straight bridge crosses only former ink (never white).
+    """
+    if len(paths) < 2:
+        return paths
+    ox, oy = origin
+    cos_max = np.cos(np.radians(max_angle))
+    paths = [np.asarray(p, dtype=float) for p in paths]
+    while True:
+        frames = [_end_frames(p, pen) for p in paths]
+        best = None
+        for i in range(len(paths)):
+            for j in range(len(paths)):
+                if i == j:
+                    continue
+                for a in (0, 1):
+                    for b in (0, 1):
+                        (pa, da), (pb, db) = frames[i][a], frames[j][b]
+                        g = pb - pa
+                        dist = float(np.hypot(*g))
+                        if dist > max_gap * pen:
+                            continue
+                        if dist > 1e-6:
+                            gu = g / dist
+                            if gu @ da < cos_max or -(gu @ db) < cos_max:
+                                continue
+                        if -(da @ db) < cos_max:
+                            continue
+                        if _los_blocked(walkable, pa - (ox, oy), pb - (ox, oy)):
+                            continue
+                        cost = dist + pen * (1.0 - float(-(da @ db)))
+                        if best is None or cost < best[0]:
+                            best = (cost, i, j, a, b)
+        if best is None:
+            return paths
+        _, i, j, a, b = best
+        pi = paths[i] if a == 1 else paths[i][::-1]     # ends at the joint
+        pj = paths[j] if b == 0 else paths[j][::-1]     # starts at the joint
+        merged = np.vstack([pi, pj])
+        paths = [p for k, p in enumerate(paths) if k not in (i, j)] + [merged]
+
+
 def _extend_ends_to_frame(paths: list[np.ndarray], mask: np.ndarray,
                           walkable: np.ndarray, pen: float, origin) -> list[np.ndarray]:
     """Re-grow curve ends near the frame on the full (un-thinned) mask.
@@ -1027,10 +1131,14 @@ def _extend_ends_to_frame(paths: list[np.ndarray], mask: np.ndarray,
     return out
 
 
-def _split_thin(mask: np.ndarray, pen: float) -> tuple[np.ndarray, np.ndarray]:
-    """(mask opened by ~40 % of the pen, the thin remainder)."""
+def _split_thin(mask: np.ndarray, pen: float, rel: float = 0.2) -> tuple[np.ndarray, np.ndarray]:
+    """(mask opened by a (2r+1)² square, r = rel·pen; the thin remainder).
+
+    rel = 0.2 for the tracer body: curves whose edge was eaten by grid
+    subtraction must survive.  rel = 0.3 for arrow-shaft search: anti-aliasing
+    widens a thin shaft to ~0.55 pen."""
     from scipy import ndimage
-    r = int(0.2 * pen)
+    r = int(rel * pen)
     if r < 1:
         return mask, np.zeros_like(mask)
     body = ndimage.binary_opening(mask, structure=np.ones((2 * r + 1, 2 * r + 1), bool))
@@ -1039,16 +1147,19 @@ def _split_thin(mask: np.ndarray, pen: float) -> tuple[np.ndarray, np.ndarray]:
     return body, mask & ~body
 
 
-def _line_fragments(thin: np.ndarray, pen: float) -> list[np.ndarray]:
+def _line_fragments(thin: np.ndarray, pen: float, exclude=()) -> list[np.ndarray]:
     """Straight, thin, oblique components of `thin` as [end, end] segments.
 
     These are callout-arrow shafts (thinner than the curves by the width
-    hierarchy).  Axis-parallel pieces are grid residue and skipped.
+    hierarchy) — or pieces of them: grid lines cut a thin shaft apart, so
+    pieces from 1.5 pens on are returned and the caller follows each along
+    the ink.  Axis-parallel pieces are grid residue, pieces inside text boxes
+    (`exclude`) glyph strokes; both are skipped.
     """
     from scipy import ndimage
     lab, n = ndimage.label(thin, structure=np.ones((3, 3), bool))
     out = []
-    min_len = max(10.0, 4.0 * pen)
+    min_len = max(8.0, 1.5 * pen)
     for sl, i in zip(ndimage.find_objects(lab), range(1, n + 1)):
         if sl is None:
             continue
@@ -1066,6 +1177,8 @@ def _line_fragments(thin: np.ndarray, pen: float) -> list[np.ndarray]:
             continue
         ang = abs(np.degrees(np.arctan2(ax[1], ax[0]))) % 90
         if ang < 4 or ang > 86:                   # axis-parallel: grid residue
+            continue
+        if any(b[0] <= c[0] <= b[2] and b[1] <= c[1] <= b[3] for b in exclude):
             continue
         out.append(np.vstack([c + t.min() * ax, c + t.max() * ax]))
     return out

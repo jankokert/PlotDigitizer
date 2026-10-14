@@ -52,6 +52,7 @@ sys.path.insert(0, str(ROOT))
 # tracer is then scored against the vector ground truth.
 _MUH3 = "MUH1PB,PC,PD - Figure 3 - Typical Instantaneous Forward Characteristics.png"
 _MUH4 = "MUH1PB,PC,PD - Figure 4 - Typical Reverse Characteristics.png"
+_CMZ1 = "CMZ53xxB - Zener Voltage CMZ5334B thru CMZ5350B.png"   # text as glyph outlines
 CASES = {
     "BAT46GW_fig3": "BAT46GW - Figure 3 - Typical Junction Capacitance.png",
     "CMZ53xxB": "CMZ53xxB Zener diode - V_Z-I_R.png",
@@ -60,9 +61,16 @@ CASES = {
     "MUH1PB_fig4": _MUH4,
     "MUH1PB_fig3_raster": _MUH3,
     "MUH1PB_fig4_raster": _MUH4,
+    "CMZ53xxB_pdf": _CMZ1,
+    "CMZ53xxB_pdf_raster": _CMZ1,
 }
-MODES = {"MUH1PB_fig3_raster": "raster", "MUH1PB_fig4_raster": "raster"}
-VECTOR_TWIN = {"MUH1PB_fig3_raster": "MUH1PB_fig3", "MUH1PB_fig4_raster": "MUH1PB_fig4"}
+MODES = {"MUH1PB_fig3_raster": "raster", "MUH1PB_fig4_raster": "raster",
+         "CMZ53xxB_pdf_raster": "raster"}
+VECTOR_TWIN = {"MUH1PB_fig3_raster": "MUH1PB_fig3", "MUH1PB_fig4_raster": "MUH1PB_fig4",
+               "CMZ53xxB_pdf_raster": "CMZ53xxB_pdf"}
+# Same plot from another source (old screenshot vs. the datasheet PDF): compared
+# in normalised DATA coordinates, since the pixel geometry differs.
+DATA_TWIN = {"CMZ53xxB": "CMZ53xxB_pdf"}
 
 SAME_PX = 0.5      # Hausdorff below this: identical
 CLOSE_PX = 3.0     # below this: minor change
@@ -270,12 +278,58 @@ def _print_quality(name: str, base: dict | None, cur: dict, gt) -> None:
                      f"coverage {pair('coverage', lambda v: f'{100 * v:.1f}%')}; "
                      f"resolvable p95 {pair('res_p95', lambda v: f'{v:.1f}')}px "
                      f"hit {pair('res_cov', lambda v: f'{100 * v:.1f}%')}")
+    dtwin = DATA_TWIN.get(name)
+    if dtwin and (CUR_DIR / dtwin / "summary.json").exists():
+        ref = json.loads((CUR_DIR / dtwin / "summary.json").read_text(encoding="utf-8"))
+        r = data_check(cur, ref)
+        parts.append(f"vs {dtwin} (data): labels {r['ok']}/{r['tot']}"
+                     + (f" WRONG: {', '.join(r['wrong'])}" if r["wrong"] else "")
+                     + f", err mean {100 * r['mean']:.2f}% p95 {100 * r['p95']:.2f}% of axis")
     twin = VECTOR_TWIN.get(name)
     if twin and (CUR_DIR / twin / "summary.json").exists():
         ref = json.loads((CUR_DIR / twin / "summary.json").read_text(encoding="utf-8"))
         ok, tot, wrong = label_check(cur["curves_px"], ref["curves_px"])
         parts.append(f"labels vs vector {ok}/{tot}" + (f" WRONG: {', '.join(wrong)}" if wrong else ""))
     print(f"{'':<20}   quality  {'; '.join(parts)}")
+
+
+def _to_unit(summary: dict, ref: dict, pts) -> np.ndarray:
+    """Curve pixels of `summary` -> data -> unit square of `ref`'s axes
+    (log axes in decades)."""
+    from plot_digitizer.axis_reader import pixel_to_data
+    p = np.asarray(pts, dtype=float)
+    out = []
+    for k, ax in ((0, "x"), (1, "y")):
+        cal, rcal = summary[f"{ax}_calib"], ref[f"{ax}_calib"]
+        pa = ref["plot_area"]
+        lo, hi = (pa[0], pa[2]) if ax == "x" else (pa[3], pa[1])
+        v = np.array([pixel_to_data(t, cal) for t in p[:, k]])
+        a, b = pixel_to_data(lo, rcal), pixel_to_data(hi, rcal)
+        if (rcal[4] if len(rcal) > 4 else "lin") == "log":
+            v, a, b = np.log10(np.clip(v, 1e-300, None)), np.log10(a), np.log10(b)
+        out.append((v - a) / (b - a))
+    return np.column_stack(out)
+
+
+def data_check(cur: dict, ref: dict) -> dict:
+    """Same-named curves of two extractions of one plot, in `ref`'s unit
+    square: label agreement and distance (fraction of the axis span)."""
+    rc = {n: _densify(_to_unit(ref, ref, c), 0.002) for n, c in ref["curves_px"].items()}
+    cc = {n: _to_unit(cur, ref, c) for n, c in cur["curves_px"].items()}
+    trees = {n: cKDTree(c) for n, c in rc.items()}
+    ok, wrong, errs = 0, [], []
+    for n, c in cc.items():
+        d = {m: t.query(c)[0].mean() for m, t in trees.items()}
+        best = min(d, key=d.get)
+        if n in rc:
+            if best == n:
+                ok += 1
+            else:
+                wrong.append(f"{n}->{best}")
+            errs.append(trees[n].query(c)[0])
+    e = np.concatenate(errs) if errs else np.array([np.inf])
+    return {"ok": ok, "tot": len(rc), "wrong": wrong,
+            "mean": float(e.mean()), "p95": float(np.percentile(e, 95))}
 
 
 def label_check(curves: dict, ref: dict) -> tuple[int, int, list[str]]:

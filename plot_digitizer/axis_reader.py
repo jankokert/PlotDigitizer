@@ -100,16 +100,18 @@ def _read_x_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
 
     x_min, y_min, x_max, y_max = plot_area
     h, w = img_array.shape[:2]
-    crop_top = y_max + 3
-    crop_bot = min(h, y_max + 70)
+    # Strip sizes relative to the plot (tuned at ~150 dpi: 70 px / 20 px for a
+    # ~450 px tall canvas), so high-resolution PDF renders work the same.
+    strip, pad = _strip_sizes(plot_area)
+    crop_top = y_max + max(3, int(0.005 * (y_max - y_min)))
+    crop_bot = min(h, y_max + strip)
     if crop_top >= crop_bot:
         return None
 
     # Widen the strip past the box so edge labels (e.g. 0 and 100) are not clipped.
-    pad = 20
     cx0 = max(0, x_min - pad)
     crop = img_array[crop_top:crop_bot, cx0:min(w, x_max + pad)]
-    readings = _ocr_numbers(crop, pt)  # (crop_col, value)
+    readings = _ocr_numbers(crop, pt, scale=_ocr_scale(strip))  # (crop_col, value)
 
     if len(readings) < 2:
         return None
@@ -133,16 +135,17 @@ def _read_y_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
 
     x_min, y_min, x_max, y_max = plot_area
     h = img_array.shape[0]
-    crop_left = max(0, x_min - 90)
-    crop_right = max(0, x_min - 3)
+    strip, pad = _strip_sizes(plot_area)
+    ystrip = int(round(strip * 90 / 70))         # y labels are wider ("10,000")
+    crop_left = max(0, x_min - ystrip)
+    crop_right = max(0, x_min - max(3, int(0.005 * (x_max - x_min))))
     if crop_left >= crop_right:
         return None
 
     # Widen the strip past the box so edge labels (e.g. 0 and 20) are not clipped.
-    pad = 20
     cy0 = max(0, y_min - pad)
     crop = img_array[cy0:min(h, y_max + pad), crop_left:crop_right]
-    readings = _ocr_numbers(crop, pt, horizontal=False)  # (crop_row, value)
+    readings = _ocr_numbers(crop, pt, horizontal=False, scale=_ocr_scale(strip))
 
     if len(readings) < 2:
         return None
@@ -159,11 +162,12 @@ def _read_y_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
 
 
 def _parse_number(text: str) -> Optional[float]:
-    t = text.strip().replace("−", "-").replace(",", ".").replace(" ", "")
-    try:
-        return float(t)
-    except ValueError:
+    """A text line that is exactly one number (PDF tick label)."""
+    import re
+    t = text.strip().replace("−", "-").replace(" ", "")
+    if not re.fullmatch(r"[-+]?[\d.,]+", t):
         return None
+    return parse_tick_number(t)
 
 
 def _ticks_from_text(text_labels: list[dict], plot_area):
@@ -224,18 +228,23 @@ def _fit_axis(
     """
     lin = _robust_line(pts)
     log = None
-    if len(pts) >= 3 and all(v > 0 for _, v in pts):
+    # Non-positive readings can't lie on a log axis: on a log hypothesis they
+    # are outliers (an OCR "-4" from "10^-4"), not a veto against log.
+    pos = [(p, v) for p, v in pts if v > 0]
+    if len(pos) >= 3:
         # 0.05 in log10 ≈ 12 % value error — tight enough that a linear axis
         # does *not* masquerade as log.
-        log = _robust_line([(p, math.log10(v)) for p, v in pts], tol=0.05)
+        log = _robust_line([(p, math.log10(v)) for p, v in pos], tol=0.05)
 
     n_lin = len(lin[2]) if lin else 0
     n_log = len(log[2]) if log else 0
     # A positive axis whose ticks span more than ~1.7 decades is log — and with
     # a huge value span the linear tolerance balloons so a log ladder can look
     # "linear", so when ≥3 ticks are collinear in log space we trust log.
-    vals = [v for _, v in pts]
-    wide_range = all(v > 0 for _, v in pts) and (max(vals) / min(vals) > 50)
+    # Judge the span on the ticks that actually lie on the log line: OCR
+    # garbage ("1.0012e+21") must not make a linear axis look wide.
+    vals = [10.0 ** lv for _, lv in log[2]] if log is not None else []
+    wide_range = len(vals) >= 3 and max(vals) / min(vals) > 50
     if log is not None and n_log >= 3 and (wide_range or n_log > n_lin):
         use_log = True
     else:
@@ -283,22 +292,27 @@ def _robust_line(
     # RANSAC: a single misread label tilts a least-squares fit through *all*
     # points, so instead find the line supported by the largest collinear
     # subset. Axis ticks are exactly collinear, so the true line wins.
-    vals = [v for _, v in pts]
-    span = max(vals) - min(vals)
-    if tol is None:
-        tol = max(0.02 * span, 0.5)  # data-units a label may deviate and still count
+    # Inlier test in PIXELS: a tick counts if its value puts it where it is
+    # on the axis (within 1.5 % of the tick extent).  A data-unit tolerance
+    # derived from the value span is inflated by a single misread ("210" for
+    # "10") and then admits garbage readings.  `tol` (data units) is an
+    # additional upper bound when given.
+    pix = [p for p, _ in pts]
+    tol_px = max(3.0, 0.015 * (max(pix) - min(pix)))
 
     best_inliers: list[tuple[float, float]] = []
     best_err = float("inf")
     for a in range(len(pts)):
         for b in range(a + 1, len(pts)):
             (pa, va), (pb, vb) = pts[a], pts[b]
-            if pa == pb:
+            if pa == pb or va == vb:
                 continue
             slope = (vb - va) / (pb - pa)
             intercept = va - slope * pa
-            inliers = [(p, v) for p, v in pts if abs(v - (slope * p + intercept)) <= tol]
-            err = sum((v - (slope * p + intercept)) ** 2 for p, v in inliers)
+            inliers = [(p, v) for p, v in pts
+                       if abs(p - (v - intercept) / slope) <= tol_px
+                       and (tol is None or abs(v - (slope * p + intercept)) <= tol)]
+            err = sum((p - (v - intercept) / slope) ** 2 for p, v in inliers)
             if len(inliers) > len(best_inliers) or (
                 len(inliers) == len(best_inliers) and err < best_err
             ):
@@ -313,10 +327,46 @@ def _robust_line(
     return float(slope), float(intercept), best_inliers
 
 
+def _strip_sizes(plot_area) -> tuple[int, int]:
+    """(label strip depth, edge padding) in px, scaled with the plot size.
+
+    The original constants (70 px strip, 20 px padding) were tuned on ~150 dpi
+    screenshots whose canvases are ~450 px tall; never smaller than those."""
+    x_min, y_min, x_max, y_max = plot_area
+    ref = max(1.0, min(x_max - x_min, y_max - y_min) / 450.0)
+    return int(round(70 * ref)), int(round(20 * ref))
+
+
+def _ocr_scale(strip: int) -> int:
+    """Upscale factor so the digits reach the size Tesseract was tuned on
+    (4x for a 70 px strip; none for a high-resolution render)."""
+    return int(np.clip(round(4 * 70 / max(strip, 1)), 1, 4))
+
+
+def parse_tick_number(text: str) -> Optional[float]:
+    """'10,000' -> 10000, '0,5' -> 0.5, '-40' -> -40, '1.2' -> 1.2."""
+    import re
+    t = text.strip().replace("−", "-").replace(" ", "")
+    m = re.search(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d*[.,]?\d+", t)
+    if not m:
+        return None
+    g = m.group()
+    if re.fullmatch(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", g) and not g.lstrip("+-").startswith("0,"):
+        g = g.replace(",", "")                       # thousands separators
+    else:
+        g = g.replace(",", ".")                      # decimal comma
+    try:
+        v = float(g)
+    except ValueError:
+        return None
+    return v if abs(v) < 1e12 else None          # OCR garbage, not a tick
+
+
 def _ocr_numbers(
     crop: np.ndarray,
     pt,
     horizontal: bool = True,
+    scale: int = 4,
 ) -> list[tuple[float, float]]:
     """
     Run OCR on `crop` and return list of (pixel_pos, numeric_value).
@@ -335,27 +385,21 @@ def _ocr_numbers(
     # ones — RANSAC in the fit discards whatever disagrees.
     gray = np.asarray(PILImage.fromarray(crop).convert("L"))
     binary = np.where(gray < 128, 0, 255).astype(np.uint8)
-    scale = 4
     pil_img = PILImage.fromarray(binary).resize(
         (binary.shape[1] * scale, binary.shape[0] * scale), PILImage.LANCZOS
     )
 
-    num_re = re.compile(r"\d*\.?\d+")
     results: list[tuple[float, float]] = []
     for psm in (6, 11):
         try:
-            config = f"--psm {psm} -c tessedit_char_whitelist=0123456789.-eE+"
+            config = f"--psm {psm} -c tessedit_char_whitelist=0123456789.,-eE+"
             data = pt.image_to_data(pil_img, output_type=pt.Output.DICT, config=config)
         except Exception as exc:
             logger.error(f"OCR error: {exc}")
             continue
         for i, text in enumerate(data["text"]):
-            m = num_re.search(text.strip())
-            if not m:
-                continue
-            try:
-                value = float(m.group())
-            except ValueError:
+            value = parse_tick_number(text)
+            if value is None:
                 continue
             col_c = (data["left"][i] + data["width"][i] / 2) / scale
             row_c = (data["top"][i] + data["height"][i] / 2) / scale

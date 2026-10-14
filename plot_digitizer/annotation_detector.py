@@ -1,17 +1,15 @@
-"""Detect textual annotations (labels) in a plot canvas.
+"""Detect textual annotations (labels, notes, legends) and callout arrows.
 
-Datasheet plots carry text labels — axis-style callouts like "0.160 A" or a
-note like "f=1.0MHz" — that almost always sit on a small **white background box**
-punched into the grid so the text stays readable.  That gives two robust,
-model-free cues we combine here:
+* ``detect_text_labels_ocr`` - word-level OCR of in-plot labels (used when the
+  PDF has no text layer, or for bitmap input).
+* ``detect_arrows`` - pairs labels with solid arrowheads (and, for legends,
+  horizontal on-grid arrows); feeds the parametric arrow model.
+* ``detect_legend_boxes`` - a legend is a regular stack holding all labels.
+* ``detect_grid_boxes`` / ``expand_to_white`` - white text patches punched
+  into the grid (debug display, arrow-less notes).
 
-1. the glyphs are *compact* dark ink (short runs in both directions), unlike the
-   long thin grid lines or the thick data curves; and
-2. the box interrupts the grid — inside it there is no long line, only the
-   compact glyphs on white.
-
-Detecting and masking these regions *before* the grid/curve pixel arithmetic
-keeps annotations from corrupting the geometry (the "annotations first" order).
+Pixel constants are tuned at ~150 dpi; the arrow code scales them with the
+resolution factor passed in by the caller.
 """
 
 from __future__ import annotations
@@ -21,58 +19,6 @@ from typing import Optional
 import numpy as np
 
 from .curve_extractor import _run_length
-
-
-def detect_text_boxes(
-    ink: np.ndarray,
-    glyph_run: int = 12,
-    pad: int = 6,
-) -> list[tuple[int, int, int, int]]:
-    """
-    Return bounding boxes (x0, y0, x1, y1) of text-label regions in canvas
-    pixel coords.
-
-    `ink` is the boolean achromatic-ink mask of the canvas.  A glyph pixel has a
-    short contiguous run in *both* axes (`<= glyph_run`); grid lines and curves
-    do not.  Compact glyph components are clustered into text lines, and a
-    cluster is kept only if the ink inside its box is mostly glyph-ink (i.e. no
-    long grid/curve line runs through it — the white-box cue).
-    """
-    from scipy import ndimage
-
-    h, w = ink.shape
-    vr = _run_length(ink, axis=0)
-    hr = _run_length(ink, axis=1)
-    glyph = ink & (vr <= glyph_run) & (hr <= glyph_run)
-
-    lbl, n = ndimage.label(glyph, structure=np.ones((3, 3), dtype=int))
-    boxes: list[tuple[int, int, int, int]] = []
-    for i in range(1, n + 1):
-        ys, xs = np.where(lbl == i)
-        bw = int(xs.max() - xs.min()) + 1
-        bh = int(ys.max() - ys.min()) + 1
-        if 3 <= bw <= 45 and 6 <= bh <= 45 and len(xs) >= 12 and max(bw, bh) <= 6 * min(bw, bh):
-            boxes.append((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
-
-    # Cluster glyph boxes that sit on the same text line (small gaps).
-    groups = _cluster_boxes(boxes, x_gap=30, y_gap=12)
-
-    # Keep clusters that look like real multi-glyph labels.  We do NOT insist
-    # the grid be absent inside — datasheet labels often sit *on* grid lines —
-    # only that the cluster is several compact glyphs forming a short line of
-    # text (wider than tall, a handful of characters).
-    confirmed: list[tuple[int, int, int, int]] = []
-    for (gx0, gy0, gx1, gy1, count) in groups:
-        bw, bh = gx1 - gx0 + 1, gy1 - gy0 + 1
-        if count < 3:
-            continue
-        if bw < 18 or bh < 8:
-            continue
-        if bw < 1.3 * bh:          # a text line is clearly wider than tall
-            continue
-        confirmed.append((max(0, gx0 - pad), max(0, gy0 - pad),
-                          min(w, gx1 + pad + 1), min(h, gy1 + pad + 1)))
-    return confirmed
 
 
 def detect_legend_boxes(
@@ -303,6 +249,7 @@ def detect_arrows(
     grid_mask: np.ndarray,
     labels: Optional[list[dict]] = None,
     match_radius: int = 200,
+    scale: float = 1.0,
 ) -> list[dict]:
     """
     Detect annotation arrows by pairing OCR text labels with solid arrowheads.
@@ -347,12 +294,13 @@ def detect_arrows(
     # Arrowhead candidates: compact fat cores (survive erosion by ~3 px), and
     # compact (curve bodies erode to long thin cores, so shape rejects them).
     dist = ndimage.distance_transform_edt(fg)
-    lbl, n = ndimage.label(dist >= 3.25)
+    # Pixel constants tuned at ~150 dpi, multiplied by the resolution `scale`.
+    lbl, n = ndimage.label(dist >= 3.25 * scale)
     heads = []
     for i in range(1, n + 1):
         ys, xs = np.where(lbl == i)
         bw, bh = int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1
-        if (len(xs) < 8 or max(bw, bh) > 22 or min(bw, bh) < 3
+        if (len(xs) < 8 * scale * scale or max(bw, bh) > 22 * scale or min(bw, bh) < 3 * scale
                 or max(bw, bh) > 3.5 * min(bw, bh)):
             continue
         heads.append({"cx": int(xs.mean()), "cy": int(ys.mean()),
@@ -365,7 +313,7 @@ def detect_arrows(
     for li, lab in enumerate(labels):
         lx0, ly0, lx1, ly1 = lab["box"]
         acx, acy = (lx0 + lx1) // 2, (ly0 + ly1) // 2
-        best, best_d = None, match_radius ** 2
+        best, best_d = None, (match_radius * scale) ** 2
         for j, hd in enumerate(heads):
             if j in used:
                 continue
@@ -405,7 +353,7 @@ def detect_arrows(
     if unmatched:
         h_img, w_img = ink.shape
         vrun = _run_length(ink, axis=0)
-        bold = ink & (vrun >= 3)                    # bolder than a thin grid line
+        bold = ink & (vrun >= 3 * scale)            # bolder than a thin grid line
         label_zone = np.zeros_like(ink)
         for lab in labels:                          # a neighbour's glyphs are not a shaft
             a, bb, c, dd = lab["box"]
@@ -414,14 +362,14 @@ def detect_arrows(
         bold_m = bold & ~label_zone
         ink_m = ink & ~label_zone
         for lab in unmatched:
-            arr = _trace_horizontal_arrow(lab, ink_m, bold_m)
+            arr = _trace_horizontal_arrow(lab, ink_m, bold_m, scale=scale)
             if arr is not None:
                 arrows.append(arr)
     return arrows
 
 
 def _trace_horizontal_arrow(lab: dict, ink_m: np.ndarray, bold_m: np.ndarray,
-                            half_band: int = 7) -> Optional[dict]:
+                            half_band: int = 7, scale: float = 1.0) -> Optional[dict]:
     """
     Trace a horizontal callout arrow that points LEFT from a right-side label to
     its curve (the USFF case).  The shaft lies on a grid line, so instead of the
@@ -430,18 +378,25 @@ def _trace_horizontal_arrow(lab: dict, ink_m: np.ndarray, bold_m: np.ndarray,
     *wide* thickness run (the triangular head ~8 px, vs 1–2 px grid crossings).
 
     Returns an arrow dict or None.  Gated on span>=40 and a head thickness peak
-    >=10 so grid/curve crossings don't masquerade as arrows.
+    >=10 so grid/curve crossings don't masquerade as arrows.  All pixel
+    constants are for ~150 dpi and multiplied by `scale`.
     """
+    def k(v: float) -> int:
+        return int(round(v * scale))
+
     h_img, w_img = ink_m.shape
     lx0, ly0, lx1, ly1 = lab["box"]
     yc = (ly0 + ly1) // 2
-    y_lo, y_hi = max(1, yc - 9), min(h_img - 1, yc + 10)
+    half_band = k(half_band)
+    y_lo, y_hi = max(1, yc - k(9)), min(h_img - 1, yc + k(10))
     counts = [(int(bold_m[yy, 0:lx0].sum()), yy) for yy in range(y_lo, y_hi)]
-    cnt, row = max(counts)
-    if cnt < 25:
+    if not counts:
         return None
-    thick = ink_m[row - half_band:row + half_band + 1, 0:lx0].sum(axis=0)
-    wide = np.where(thick >= 8)[0]
+    cnt, row = max(counts)
+    if cnt < k(25):
+        return None
+    thick = ink_m[max(0, row - half_band):row + half_band + 1, 0:lx0].sum(axis=0)
+    wide = np.where(thick >= k(8))[0]
     if len(wide) == 0:
         return None
     # leftmost run of >=4 consecutive wide columns = the arrowhead
@@ -451,17 +406,17 @@ def _trace_horizontal_arrow(lab: dict, ink_m: np.ndarray, bold_m: np.ndarray,
         if xi == prev + 1:
             prev = xi
         else:
-            if prev - start + 1 >= 4:
+            if prev - start + 1 >= k(4):
                 runs.append((start, prev))
             start = prev = xi
-    if prev - start + 1 >= 4:
+    if prev - start + 1 >= k(4):
         runs.append((start, prev))
     if not runs:
         return None
     hs, he = min(runs)
     span = lx0 - hs
     peak = int(thick[hs:he + 1].max())
-    if span < 40 or peak < 10:
+    if span < k(40) or peak < k(10):
         return None
     return {"label": lab["text"],
             "tail_x": min(max(hs, lx0), lx1), "tail_y": yc,
@@ -499,121 +454,3 @@ def ocr_boxes(
         except Exception:
             out.append("")
     return out
-
-
-def trace_label_arrow(
-    ink: np.ndarray,
-    label_box: tuple[int, int, int, int],
-    x_stop: int = 0,
-    search_gap: int = 30,
-) -> Optional[dict]:
-    """
-    Follow the arrow that belongs to a label: start at the label's left edge and
-    walk the dark line LEFT (allowing vertical drift, so diagonal arrows and
-    varied heads work) until it ends on the curve it points at.
-
-    Guided detection — because the start point and direction come from the label
-    it is robust even where the shaft lies on a grid line.  Returns an arrow
-    dict {row, tip_x, tip_y, tail_x, tip_dir, path} or None if no shaft is found.
-    """
-    x0, y0, x1, y1 = label_box
-    h, w = ink.shape
-    best = None
-    for yy in range(y0, y1 + 1):
-        # locate the shaft start a little left of the label (skip the text gap)
-        start = None
-        for xx in range(x0 - 1, max(x_stop, x0 - search_gap) - 1, -1):
-            if any(0 <= yy + dy < h and ink[yy + dy, xx] for dy in (-1, 0, 1)):
-                start = xx
-                break
-        if start is None:
-            continue
-        # march left, following ink with small vertical drift
-        yc, x, run, gaps = yy, start, 0, 0
-        path = [(start, yy)]
-        while x - 1 > x_stop and gaps < 6:
-            moved = False
-            for dy in (0, -1, 1, -2, 2, -3, 3):
-                if 0 <= yc + dy < h and ink[yc + dy, x - 1]:
-                    yc += dy
-                    moved = True
-                    break
-            x -= 1
-            if moved:
-                run += 1
-                gaps = 0
-                path.append((x, yc))
-            else:
-                gaps += 1
-        if best is None or run > best[0]:
-            best = (run, yy, path)
-    if best is None or best[0] < 15:
-        return None
-    run, yy, path = best
-    tip = path[-1]
-    return {
-        "row": yy, "tip_x": tip[0], "tip_y": tip[1],
-        "tail_x": path[0][0], "tip_dir": -1, "path": path,
-    }
-
-
-def detect_label_arrows(
-    ink: np.ndarray,
-    labels: list[tuple[int, int, int, int]],
-    x_stop: int = 0,
-) -> list[dict]:
-    """Trace one arrow per label (the plausibility link: N labels ⇒ N arrows)."""
-    arrows = []
-    for b in labels:
-        a = trace_label_arrow(ink, b, x_stop=x_stop)
-        if a is not None:
-            arrows.append(a)
-    return arrows
-
-
-def snap_labels_to_legend(
-    text_boxes: list[tuple[int, int, int, int]],
-    legends: list[tuple[int, int, int, int]],
-) -> list[tuple[int, int, int, int]]:
-    """
-    Extend each label that belongs to a legend to the legend's full x-range, so
-    a label the glyph clustering under-segmented (e.g. USFF "0.160 A" caught as
-    just "60 A" where the arrow crossed it) gets its complete box back.
-    """
-    out = []
-    for b in text_boxes:
-        for lg in legends:
-            inside_y = b[1] >= lg[1] - 4 and b[3] <= lg[3] + 4
-            overlap_x = min(b[2], lg[2]) - max(b[0], lg[0]) > 0
-            if inside_y and overlap_x:
-                b = (lg[0], b[1], lg[2], b[3])
-                break
-        out.append(b)
-    return out
-
-
-def _cluster_boxes(boxes, x_gap, y_gap):
-    """Union glyph boxes whose (padded) rectangles touch; return group boxes."""
-    used = [False] * len(boxes)
-    groups = []
-    for i, bi in enumerate(boxes):
-        if used[i]:
-            continue
-        gx0, gy0, gx1, gy1 = bi
-        used[i] = True
-        count = 1
-        changed = True
-        while changed:
-            changed = False
-            for j, bj in enumerate(boxes):
-                if used[j]:
-                    continue
-                if (bj[0] <= gx1 + x_gap and bj[2] >= gx0 - x_gap
-                        and bj[1] <= gy1 + y_gap and bj[3] >= gy0 - y_gap):
-                    gx0, gy0 = min(gx0, bj[0]), min(gy0, bj[1])
-                    gx1, gy1 = max(gx1, bj[2]), max(gy1, bj[3])
-                    used[j] = True
-                    count += 1
-                    changed = True
-        groups.append((gx0, gy0, gx1, gy1, count))
-    return groups

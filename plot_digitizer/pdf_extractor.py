@@ -21,6 +21,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import pymupdf
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,11 @@ def _graphic_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
     rects = [pymupdf.Rect(d["rect"]) for d in page.get_drawings()]
     for img in page.get_images(full=True):
         rects.extend(page.get_image_rects(img[0]))
-    # Header/footer separator lines span most of the page width.
-    return [r for r in rects if r.width < 0.6 * pw and not r.is_infinite]
+    # Header/footer separator lines span most of the page width.  Lines have
+    # zero-width boxes, which PyMuPDF never treats as intersecting: give them
+    # a hairline extent so grid lines tie a plot together.
+    return [pymupdf.Rect(r.x0 - 0.25, r.y0 - 0.25, r.x1 + 0.25, r.y1 + 0.25)
+            for r in rects if r.width < 0.6 * pw and not r.is_infinite]
 
 
 def _cluster(rects: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
@@ -114,17 +118,27 @@ def _x_overlap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
     return max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
 
 
-def _pick_cluster(clusters: list[pymupdf.Rect], cap: pymupdf.Rect) -> pymupdf.Rect | None:
+def _pick_cluster(clusters: list[pymupdf.Rect], cap: pymupdf.Rect,
+                  title: bool = False) -> pymupdf.Rect | None:
+    """The plot belonging to a caption (usually below the figure) or, with
+    `title`, to a title (above the figure, or drawn inside its cluster)."""
+    if title:
+        c = cap.tl + (cap.br - cap.tl) * 0.5
+        inside = [k for k in clusters if c in k
+                  and k.width >= _MIN_FIGURE_SIZE and k.height >= _MIN_FIGURE_SIZE]
+        if inside:
+            return min(inside, key=lambda k: k.width * k.height)
     best, best_cost = None, float("inf")
     for c in clusters:
         if c.width < _MIN_FIGURE_SIZE or c.height < _MIN_FIGURE_SIZE:
             continue
         if _x_overlap(c, cap) < 0.5 * min(c.width, cap.width):
             continue
-        if c.y1 <= cap.y0 + 1:           # figure above caption (usual case)
-            cost = cap.y0 - c.y1
-        elif c.y0 >= cap.y1 - 1:         # figure below caption
-            cost = (c.y0 - cap.y1) * 1.5  # mild preference for "above"
+        above, below = (1.5, 1.0) if title else (1.0, 1.5)   # mild preference
+        if c.y1 <= cap.y0 + 1:           # figure above the caption / title
+            cost = (cap.y0 - c.y1) * above
+        elif c.y0 >= cap.y1 - 1:         # figure below
+            cost = (c.y0 - cap.y1) * below
         else:
             continue
         if cost < best_cost:
@@ -132,20 +146,48 @@ def _pick_cluster(clusters: list[pymupdf.Rect], cap: pymupdf.Rect) -> pymupdf.Re
     return best
 
 
+def _split_clusters(clusters: list[pymupdf.Rect], fig: pymupdf.Rect):
+    """(other plots, small clusters = glyph outlines / ticks) around `fig`."""
+    big = [c for c in clusters if c != fig
+           and c.width >= _MIN_FIGURE_SIZE and c.height >= _MIN_FIGURE_SIZE]
+    small = [c for c in clusters
+             if c.width < _MIN_FIGURE_SIZE or c.height < _MIN_FIGURE_SIZE]
+    return big, small
+
+
+def _rect_dist(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    dx = max(0.0, max(a.x0, b.x0) - min(a.x1, b.x1))
+    dy = max(0.0, max(a.y0, b.y0) - min(a.y1, b.y1))
+    return float(np.hypot(dx, dy))
+
+
 def _grow_with_text(page: pymupdf.Page, fig: pymupdf.Rect, cap: pymupdf.Rect,
-                    caption_rects: list[pymupdf.Rect]) -> pymupdf.Rect:
+                    caption_rects: list[pymupdf.Rect],
+                    glyphs: list[pymupdf.Rect] = (),
+                    others: list[pymupdf.Rect] = (),
+                    title: bool = False) -> pymupdf.Rect:
     """Add tick labels / axis titles lying just outside the graphics.
 
-    The x-axis title sits on the caption side; the opposite side gets only a
-    small margin so headings or notes above the plot are not pulled in.
+    "Text" is text-layer words plus small graphic clusters (`glyphs`: text
+    drawn as outlines).  A word is only taken if it is closer to this plot
+    than to any other plot on the page (`others`), so neighbouring plots'
+    labels and titles stay out.  With a caption below, the side above gets
+    only a small margin (section headings); with a `title`, the figure
+    starts at the title.
     """
-    caption_below = cap.y0 >= fig.y1 - 1
-    m_top = _FAR_SIDE_MARGIN if caption_below else _TEXT_MARGIN
-    m_bot = _TEXT_MARGIN if caption_below else _FAR_SIDE_MARGIN
+    if title:
+        m_top = m_bot = _TEXT_MARGIN
+    else:
+        caption_below = cap.y0 >= fig.y1 - 1
+        m_top = _FAR_SIDE_MARGIN if caption_below else _TEXT_MARGIN
+        m_bot = _TEXT_MARGIN if caption_below else _FAR_SIDE_MARGIN
     limit = fig + (-_MAX_TEXT_GROWTH, -_MAX_TEXT_GROWTH, _MAX_TEXT_GROWTH, _MAX_TEXT_GROWTH)
-    words = [pymupdf.Rect(w[:4]) for w in page.get_text("words")]
+    if title:
+        limit.y0 = max(limit.y0, cap.y0)
+    words = [pymupdf.Rect(w[:4]) for w in page.get_text("words")] + list(glyphs)
     words = [w for w in words
-             if w in limit and not any(w.intersects(c) for c in caption_rects)]
+             if w in limit and not any(w.intersects(c) for c in caption_rects)
+             and all(_rect_dist(w, fig) <= _rect_dist(w, o) for o in others)]
     out = pymupdf.Rect(fig)
     grown = True
     while grown:
@@ -201,8 +243,90 @@ def _safe_filename(s: str, max_len: int = 80) -> str:
     return s[:max_len].rstrip(" .")
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def _ocr_lines(page: pymupdf.Page, dpi: int = 300) -> list[tuple[pymupdf.Rect, str]]:
+    """Text lines of a page read by OCR (for PDFs whose text is drawn as
+    glyph outlines), boxes in PDF points."""
+    try:
+        import pytesseract as pt
+        from PIL import Image
+    except ImportError:
+        return []
+    pix = page.get_pixmap(dpi=dpi)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    data = pt.image_to_data(img, config="--psm 11", output_type=pt.Output.DICT)
+    k = dpi / 72.0
+    lines: dict = {}
+    for i, t in enumerate(data["text"]):
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1
+        if not t.strip() or conf < 40:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        r = pymupdf.Rect(data["left"][i], data["top"][i],
+                         data["left"][i] + data["width"][i],
+                         data["top"][i] + data["height"][i]) / k
+        if key in lines:
+            lines[key] = (lines[key][0] | r, lines[key][1] + " " + t.strip())
+        else:
+            lines[key] = (r, t.strip())
+    return list(lines.values())
+
+
+def _find_titles(doc: pymupdf.Document, query: str, min_score: float = 0.8) -> list[_Caption]:
+    """Lines matching a plot title, best first: text layer, else OCR."""
+    from difflib import SequenceMatcher
+    q = _norm(query)
+    for use_ocr in (False, True):
+        hits = []
+        for pno, page in enumerate(doc):
+            if use_ocr:
+                lines = _ocr_lines(page)
+            else:
+                lines = [(pymupdf.Rect(l["bbox"]), _line_text(l))
+                         for b in page.get_text("dict")["blocks"] for l in b.get("lines", [])]
+            for rect, text in lines:
+                t = _norm(text)
+                score = 0.95 if q and q in t else SequenceMatcher(None, q, t).ratio()
+                if score >= min_score:
+                    hits.append((-score, pno, rect.y0, rect.x0,
+                                 _Caption(pno, rect, query, text, text)))
+        if hits:
+            hits.sort(key=lambda h: h[:4])
+            if len(hits) > 1:
+                logger.info("Title matches: " + "; ".join(
+                    f"p{h[1] + 1} '{h[4].text}' ({-h[0]:.2f})" for h in hits[:5]))
+            return [h[4] for h in hits]
+    return []
+
+
 def locate_figure(doc: pymupdf.Document, figure: str) -> tuple[_Caption, pymupdf.Rect]:
-    figure = str(figure).strip().lower()
+    """Find a figure by its number ("3", caption "Fig. 3 …") or, for anything
+    else, by its title text ("Zener Voltage CMZ5334B thru CMZ5350B"); titles
+    drawn as glyph outlines are found by OCR."""
+    figure = str(figure).strip()
+    if not re.fullmatch(r"\d+[a-zA-Z]?", figure):
+        hits = _find_titles(doc, figure)
+        if not hits:
+            raise LookupError(f"No figure titled {figure!r} found (text layer and OCR)")
+        for cap in hits:
+            page = doc[cap.page]
+            clusters = _cluster(_graphic_rects(page))
+            fig = _pick_cluster(clusters, cap.rect, title=True)
+            if fig is not None:
+                big, small = _split_clusters(clusters, fig)
+                same_page = [h.rect for h in hits if h.page == cap.page and h is not cap]
+                clip = _grow_with_text(page, fig, cap.rect, same_page, glyphs=small,
+                                       others=big, title=True)
+                clip = (clip + (-_PADDING, -_PADDING, _PADDING, _PADDING)) & page.rect
+                return cap, clip
+        raise LookupError(f"Title {figure!r} found, but no plot next to it")
+    figure = figure.lower()
     caps = _find_captions(doc)
     hits = [c for c in caps if c.number == figure]
     if not hits:
@@ -212,10 +336,12 @@ def locate_figure(doc: pymupdf.Document, figure: str) -> tuple[_Caption, pymupdf
     for cap in hits:   # several hits (e.g. table of figures): first with a plot wins
         page = doc[cap.page]
         same_page_caps = [c.rect for c in caps if c.page == cap.page]
-        fig = _pick_cluster(_cluster(_graphic_rects(page)), cap.rect)
+        clusters = _cluster(_graphic_rects(page))
+        fig = _pick_cluster(clusters, cap.rect)
         if fig is None:
             continue
-        clip = _grow_with_text(page, fig, cap.rect, same_page_caps)
+        big, small = _split_clusters(clusters, fig)
+        clip = _grow_with_text(page, fig, cap.rect, same_page_caps, glyphs=small, others=big)
         clip = (clip + (-_PADDING, -_PADDING, _PADDING, _PADDING)) & page.rect
         return cap, clip
     raise LookupError(f"Caption for figure {figure!r} found on page(s) "
@@ -237,13 +363,16 @@ def extract_figure(pdf_path: Path, figure: str, out_dir: Path | None = None,
     with pymupdf.open(pdf_path) as doc:
         cap, clip = locate_figure(doc, figure)
         page = doc[cap.page]
-        stem = _safe_filename(f"{part} - Figure {cap.number}"
-                              + (f" - {cap.title}" if cap.title else ""), 150)
+        if re.fullmatch(r"\d+[a-zA-Z]?", cap.number):
+            stem = f"{part} - Figure {cap.number}" + (f" - {cap.title}" if cap.title else "")
+        else:                                    # found by title
+            stem = f"{part} - {cap.title}"
+        stem = _safe_filename(stem, 150)
         png_path = out_dir / f"{stem}.png"
         pdf_out = out_dir / f"{stem}.pdf"
 
         page.get_pixmap(clip=clip, dpi=dpi, alpha=False).save(png_path)
-        text = _text_lines(page, clip, dpi)
+        text = _text_lines(page, clip, dpi) or None   # None: text is outlines -> OCR
         vectors = _vector_paths(page, clip, dpi)
 
         with pymupdf.open() as crop:
