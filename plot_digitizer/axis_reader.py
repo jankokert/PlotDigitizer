@@ -38,6 +38,7 @@ def read_axes(
         x_calib: Calibration = (x_min, x_range[0], x_max, x_range[1], "lin")
         logger.info(f"X axis: manual range {x_range}")
     elif len(tick_x) >= 2:
+        tick_x = snap_ticks(tick_x, img_array, plot_area, "x")
         x_calib = _calib_from_ticks(tick_x, x_min, x_max, "X", debug, "x_ticks") or _default_x(plot_area)
     else:
         x_calib = _read_x_axis(img_array, plot_area, debug) or _default_x(plot_area)
@@ -48,6 +49,7 @@ def read_axes(
         y_calib: Calibration = (y_min, y_range[1], y_max, y_range[0], "lin")
         logger.info(f"Y axis: manual range {y_range}")
     elif len(tick_y) >= 2:
+        tick_y = snap_ticks(tick_y, img_array, plot_area, "y")
         y_calib = _calib_from_ticks(tick_y, y_min, y_max, "Y", debug, "y_ticks") or _default_y(plot_area)
     else:
         y_calib = _read_y_axis(img_array, plot_area, debug) or _default_y(plot_area)
@@ -117,7 +119,8 @@ def _read_x_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
         return None
 
     # Convert crop_col → image_x
-    calibration_pts = sorted((col + cx0, val) for col, val in readings)
+    calibration_pts = snap_ticks(sorted((col + cx0, val) for col, val in readings),
+                                 img_array, plot_area, "x")
     logger.info(
         f"X OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(px)}" for px, val in calibration_pts)
@@ -150,7 +153,8 @@ def _read_y_axis(img_array: np.ndarray, plot_area, debug=None) -> Optional[Calib
     if len(readings) < 2:
         return None
 
-    calibration_pts = sorted((row + cy0, val) for row, val in readings)
+    calibration_pts = snap_ticks(sorted((row + cy0, val) for row, val in readings),
+                                 img_array, plot_area, "y")
     logger.info(
         f"Y OCR: {len(readings)} labels → "
         + ", ".join(f"{val:g}@px{int(py)}" for py, val in calibration_pts)
@@ -187,6 +191,83 @@ def _ticks_from_text(text_labels: list[dict], plot_area):
         elif x1 <= x_min + 0.02 * w and cx >= x_min - 0.25 * w                 and y_min - 0.05 * h <= cy <= y_max + 0.05 * h:
             ys.append((cy, v))
     return sorted(xs), sorted(ys)
+
+
+def _axis_lines(img_array: np.ndarray, plot_area, axis: str) -> list[tuple[float, int]]:
+    """Grid lines and tick marks crossing the axis: [(centre px, thickness px)].
+
+    Two narrow bands are scanned, clear of the frame line itself:
+    * inside the frame - a line there counts only if it runs straight through
+      the whole plot (a grid line), so curves crossing the band are ignored;
+    * outside the frame - tick marks; curves never reach out there.
+    """
+    x_min, y_min, x_max, y_max = plot_area
+    gray = img_array.mean(axis=2) if img_array.ndim == 3 else img_array
+    dark = gray < 128
+    if axis == "x":                       # work on the transposed image: rows = x
+        dark = dark.T
+        x_min, y_min, x_max, y_max = y_min, x_min, y_max, x_max
+    h, w = dark.shape
+    span = x_max - x_min
+    off = max(4, int(0.01 * span))
+    bw = max(5, int(0.012 * span))
+    if axis == "y":
+        inside = dark[y_min:y_max, x_min + off:min(w, x_min + off + bw)]
+        outside = dark[y_min:y_max, max(0, x_min - off - bw):max(0, x_min - off)]
+        full = dark[y_min:y_max, x_min + off:max(x_min + off + 1, x_max - off)]
+    else:                                  # x axis: bands just above/below y_max (= x_max here)
+        inside = dark[y_min:y_max, max(0, x_max - off - bw):max(0, x_max - off)]
+        outside = dark[y_min:y_max, x_max + off:min(w, x_max + off + bw)]
+        full = dark[y_min:y_max, x_min + off:max(x_min + off + 1, x_max - off)]
+
+    def groups(band):
+        if band.size == 0:
+            return []
+        rows = np.flatnonzero(band.mean(axis=1) >= 0.6)
+        if len(rows) == 0:
+            return []
+        return np.split(rows, np.flatnonzero(np.diff(rows) > 1) + 1)
+
+    lines = []
+    for g in groups(inside):
+        if full[g].any(axis=0).mean() >= 0.5:          # straight through the plot
+            lines.append((y_min + float(g.mean()), len(g)))
+    for g in groups(outside):
+        c = y_min + float(g.mean())
+        if not any(abs(c - l[0]) <= 1.5 for l in lines):
+            lines.append((c, len(g)))
+    return sorted(lines)
+
+
+def snap_ticks(pts: list[tuple[float, float]], img_array: np.ndarray, plot_area,
+               axis: str) -> list[tuple[float, float]]:
+    """Move each tick label onto the line it labels.
+
+    A text box centre is not the tick position: the box is asymmetric ("1,000"
+    has a descending comma) and OCR passes disagree by several pixels.  The
+    labelled line is the THICKEST line near the label (a major line beats the
+    minor lines around it; among equals the nearest wins), searched within a
+    third of the label spacing.  Duplicate readings then coincide and merge.
+    """
+    if len(pts) < 2:
+        return pts
+    lines = _axis_lines(img_array, plot_area, axis)
+    if not lines:
+        return pts
+    pos = sorted({round(p) for p, _ in pts})
+    gaps = [b - a for a, b in zip(pos[:-1], pos[1:]) if b - a > 2]
+    if not gaps:
+        return pts
+    tol = 0.35 * float(np.median(gaps))
+    out = []
+    for p, v in pts:
+        near = [(c, t) for c, t in lines if abs(c - p) <= tol]
+        if near:
+            tmax = max(t for _, t in near)
+            c = min((c for c, t in near if t >= 0.8 * tmax), key=lambda c: abs(c - p))
+            p = c
+        out.append((p, v))
+    return sorted(dict.fromkeys(out))
 
 
 def _calib_from_ticks(pts, p_lo, p_hi, name, debug, key) -> Optional[Calibration]:

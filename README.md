@@ -217,7 +217,10 @@ is headed `T_A in °C` and holds just `25`, `100`, … Part-number series
 (`CMZ5334B`, `CMZ5335B`, …) form a `part` column instead. OCR look-alikes are
 tolerated (`cMzs34eB` → `CMZ5346B`). Without a PDF text layer, labels and
 tick numbers are read by OCR. Tick numbers may use thousands separators or a
-decimal comma, and lin/log is decided from the ticks that fit. Labels are matched to
+decimal comma, and lin/log is decided from the ticks that fit. Each tick label is snapped onto the line it labels: the thickest grid line
+running through the plot, or a tick mark outside the frame, near the label.
+A text-box centre is not the tick position, since "1,000" has a descending
+comma and OCR passes disagree by pixels. Labels are matched to
 curves via their arrows (traced arrow shafts are followed to the curve and
 dropped from the data), or by vertical order when there are no arrows.
 
